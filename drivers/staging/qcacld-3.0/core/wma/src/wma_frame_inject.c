@@ -73,30 +73,34 @@ static inline void wma_injection_unmap_tx_buf(qdf_nbuf_t buf)
 #endif
 
 /* Maximum number of frames in WMA injection queue */
-#define WMA_FRAME_INJECT_MAX_QUEUE_SIZE    512
+#define WMA_FRAME_INJECT_MAX_QUEUE_SIZE    4096
 
 /* Maximum frame size for injection */
-#define WMA_FRAME_INJECT_MAX_FRAME_SIZE    2304
+#define WMA_FRAME_INJECT_MAX_FRAME_SIZE    2346
 
 /* Timeout for queue processing work in milliseconds */
-#define WMA_FRAME_INJECT_QUEUE_TIMEOUT_MS  100
+#define WMA_FRAME_INJECT_QUEUE_TIMEOUT_MS  50
 
 /* Reaper timer interval: how often we scan for stale in-flight nbufs (ms) */
-#define WMA_INJECTION_REAPER_INTERVAL_MS   3000
+#define WMA_INJECTION_REAPER_INTERVAL_MS   50
 
 /*
- * Maximum age (in microseconds, QDF log-timestamp units) before an
- * in-flight nbuf is considered abandoned by firmware and reaped.
- * 2 seconds is generous — normal completions arrive in < 50 ms.
+ * Maximum age before an in-flight nbuf is considered abandoned by firmware and reaped.
+ * Over-the-air 802.11 mgmt frame transmission finishes DMA in < 1-2 ms. A 50 ms timeout
+ * ensures rapid recycling and eliminates queue starvation/backpressure during sustained injection.
  */
-#define WMA_INJECTION_NBUF_TIMEOUT_US      2000000ULL
+#define WMA_INJECTION_NBUF_TIMEOUT_US      50000ULL
 
 /*
- * Maximum number of in-flight (submitted but uncomplemented) nbufs before
- * we start rejecting new enqueue requests.  Keeps DMA-mapped memory bounded
- * when firmware silently drops completions for the helper STA vdev.
+ * Maximum number of in-flight nbufs before backpressure handling.
  */
-#define WMA_INJECTION_INFLIGHT_HIGH        200
+#define WMA_INJECTION_INFLIGHT_HIGH        2048
+
+/* Helper vdev maximum idle duration before keepalive refresh (45 seconds) */
+#define WMA_INJECTION_VDEV_MAX_IDLE_US     45000000ULL
+
+/* Maximum consecutive firmware discards before automatic helper recreation */
+#define WMA_INJECTION_MAX_DISCARDS_BEFORE_RECREATE 3
 
 /**
  * struct wma_injection_queue_node - Node for injection queue
@@ -159,7 +163,7 @@ static bool inject_patch_banner_logged;
  * Keep a small best-effort debug cache so firmware completion status can be
  * correlated with the frame metadata for the corresponding desc_id.
  */
-#define WMA_INJECTION_DEBUG_CACHE_SIZE 256
+#define WMA_INJECTION_DEBUG_CACHE_SIZE 4096
 struct wma_injection_debug_info {
 	bool valid;
 	uint32_t desc_id;
@@ -176,6 +180,7 @@ struct wma_injection_debug_info {
 
 static struct wma_injection_debug_info
 	g_wma_injection_debug_cache[WMA_INJECTION_DEBUG_CACHE_SIZE];
+static qdf_spinlock_t g_wma_injection_debug_lock;
 
 /*
  * Hidden AP vdev for injection TX on monitor mode.
@@ -204,11 +209,16 @@ struct wma_injection_tx_vdev {
 	uint8_t monitor_vdev_id;
 	uint32_t chanfreq;
 	uint8_t mac_addr[QDF_MAC_ADDR_SIZE];
+	uint64_t last_tx_ts;
+	uint32_t consecutive_discards;
 };
 
 static struct wma_injection_tx_vdev g_inj_tx_vdev;
+static qdf_mutex_t g_inj_tx_vdev_mutex;
 
+static void __wma_injection_destroy_tx_vdev(tp_wma_handle wma);
 static void wma_injection_destroy_tx_vdev(tp_wma_handle wma);
+static uint32_t wma_injection_reap_stale_nbufs(bool force);
 
 /**
  * wma_injection_reset_session_state() - Reset per-session static state
@@ -267,28 +277,94 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 	struct vdev_create_params vcreate;
 	struct vdev_start_params vstart;
 	struct peer_create_params pcreate;
-	uint8_t *mon_mac;
+	uint8_t *mon_mac = NULL;
 	uint8_t inj_mac[QDF_MAC_ADDR_SIZE];
 	uint8_t vid = 0;
 	bool found = false;
+	bool got_mac = false;
 	int i;
 	QDF_STATUS status;
 
-	if (g_inj_tx_vdev.created) {
-		if (g_inj_tx_vdev.chanfreq == chanfreq)
+	if (!wma || !wma->wmi_handle)
+		return QDF_STATUS_E_INVAL;
+
+	qdf_mutex_acquire(&g_inj_tx_vdev_mutex);
+
+	/*
+	 * If frequency is zero or unassigned, fallback to existing helper frequency,
+	 * any active interface frequency, or default 2412 MHz.
+	 */
+	if (!chanfreq) {
+		if (g_inj_tx_vdev.created && g_inj_tx_vdev.chanfreq) {
+			qdf_mutex_release(&g_inj_tx_vdev_mutex);
 			return QDF_STATUS_SUCCESS;
-		/* Channel changed – tear down and recreate */
-		wma_injection_destroy_tx_vdev(wma);
+		}
+
+		for (i = 0; i < (int)wma->max_bssid; i++) {
+			if (wma->interfaces[i].mhz) {
+				chanfreq = wma->interfaces[i].mhz;
+				break;
+			}
+		}
+		if (!chanfreq)
+			chanfreq = 2412;
+	}
+
+	if (g_inj_tx_vdev.created) {
+		bool need_refresh = false;
+		uint64_t now_ts = qdf_get_log_timestamp();
+
+		/* Check 1: Channel changed */
+		if (g_inj_tx_vdev.chanfreq != chanfreq)
+			need_refresh = true;
+
+		/* Check 2: VDEV ID collision with host interface */
+		if (!need_refresh && g_inj_tx_vdev.vdev_id < wma->max_bssid &&
+		    wma->interfaces[g_inj_tx_vdev.vdev_id].vdev) {
+			wma_info("Injection helper vdev %u claimed by host interface, refreshing",
+				 g_inj_tx_vdev.vdev_id);
+			need_refresh = true;
+		}
+
+		/* Check 3: Consecutive firmware discard errors */
+		if (!need_refresh &&
+		    g_inj_tx_vdev.consecutive_discards >= WMA_INJECTION_MAX_DISCARDS_BEFORE_RECREATE) {
+			wma_info("Injection helper vdev has %u consecutive discards, refreshing",
+				 g_inj_tx_vdev.consecutive_discards);
+			need_refresh = true;
+		}
+
+		/*
+		 * Check 4: Prolonged idle duration
+		 * If interface has been idle for > 45 seconds without reset,
+		 * firmware power save or beacon tracking may have expired the peer.
+		 * Proactively refresh so injection is guaranteed to succeed immediately.
+		 */
+		if (!need_refresh && g_inj_tx_vdev.last_tx_ts) {
+			uint64_t idle_us = qdf_log_timestamp_to_usecs(now_ts - g_inj_tx_vdev.last_tx_ts);
+			if (idle_us > WMA_INJECTION_VDEV_MAX_IDLE_US) {
+				wma_info("Injection helper vdev idle for %llu ms, performing keepalive refresh",
+					 idle_us / 1000);
+				need_refresh = true;
+			}
+		}
+
+		if (!need_refresh) {
+			qdf_mutex_release(&g_inj_tx_vdev_mutex);
+			return QDF_STATUS_SUCCESS;
+		}
+
+		/* Channel changed or health check failed – tear down and recreate */
+		__wma_injection_destroy_tx_vdev(wma);
 	}
 
 	/*
-	 * Firmware vdev array supports IDs 0..(num_vdevs-1).  num_vdevs is
-	 * at most CFG_TGT_NUM_VDEV (typically 4) and may be decremented by 1
-	 * for NAN → 3.  Use (CFG_TGT_NUM_VDEV - 2) as safe ceiling so we
-	 * never exceed the firmware's internal array.
+	 * Firmware vdev array supports IDs 0..(num_vdevs-1). num_vdevs is
+	 * CFG_TGT_NUM_VDEV (typically 4: IDs 0, 1, 2, 3).
+	 * Check from (CFG_TGT_NUM_VDEV - 1) down to 0 for an unused slot.
 	 */
 	{
-		int fw_max_vid = CFG_TGT_NUM_VDEV - 2;
+		int fw_max_vid = CFG_TGT_NUM_VDEV - 1;
 
 		if (fw_max_vid >= (int)wma->max_bssid)
 			fw_max_vid = (int)wma->max_bssid - 1;
@@ -304,20 +380,50 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 	}
 	if (!found) {
 		wma_err("Injection: no unused vdev slot for TX helper");
+		qdf_mutex_release(&g_inj_tx_vdev_mutex);
 		return QDF_STATUS_E_RESOURCES;
 	}
 
 	/* New vdev being created — reset session state for a clean start */
 	wma_injection_reset_session_state();
 
-	mon_mac = wlan_vdev_mlme_get_macaddr(
-			wma->interfaces[mon_vdev_id].vdev);
-	if (!mon_mac) {
-		wma_err("Injection: cannot read monitor vdev MAC");
-		return QDF_STATUS_E_FAILURE;
+	/*
+	 * Safely obtain a base MAC address. mon_vdev_id might not have an
+	 * active vdev in wma->interfaces.
+	 */
+	if (mon_vdev_id < wma->max_bssid && wma->interfaces[mon_vdev_id].vdev) {
+		mon_mac = wlan_vdev_mlme_get_macaddr(
+				wma->interfaces[mon_vdev_id].vdev);
+		if (mon_mac) {
+			qdf_mem_copy(inj_mac, mon_mac, QDF_MAC_ADDR_SIZE);
+			got_mac = true;
+		}
 	}
-	qdf_mem_copy(inj_mac, mon_mac, QDF_MAC_ADDR_SIZE);
-	inj_mac[0] |= 0x02; /* locally-administered */
+
+	if (!got_mac) {
+		for (i = 0; i < (int)wma->max_bssid; i++) {
+			if (wma->interfaces[i].vdev) {
+				mon_mac = wlan_vdev_mlme_get_macaddr(
+						wma->interfaces[i].vdev);
+				if (mon_mac) {
+					qdf_mem_copy(inj_mac, mon_mac, QDF_MAC_ADDR_SIZE);
+					got_mac = true;
+					break;
+				}
+			}
+		}
+	}
+
+	if (!got_mac) {
+		inj_mac[0] = 0x02;
+		inj_mac[1] = 0x00;
+		inj_mac[2] = 0xde;
+		inj_mac[3] = 0xad;
+		inj_mac[4] = 0xbe;
+		inj_mac[5] = 0xef;
+	} else {
+		inj_mac[0] |= 0x02; /* locally-administered */
+	}
 
 	/* ---------- 1. VDEV CREATE (STA type) ---------- */
 	/*
@@ -338,6 +444,7 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 					      inj_mac, &vcreate);
 	if (QDF_IS_STATUS_ERROR(status)) {
 		wma_err("Injection TX vdev create failed: %d", status);
+		qdf_mutex_release(&g_inj_tx_vdev_mutex);
 		return status;
 	}
 	/* Firmware processes WMI commands asynchronously.  Each step must
@@ -363,7 +470,7 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 	status = wmi_unified_vdev_start_send(wma->wmi_handle, &vstart);
 	if (QDF_IS_STATUS_ERROR(status)) {
 		wma_err("Injection TX vdev start failed: %d", status);
-		goto err_stop;
+		goto err_delete;
 	}
 	msleep(150);
 
@@ -391,37 +498,79 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 	g_inj_tx_vdev.vdev_id          = vid;
 	g_inj_tx_vdev.monitor_vdev_id  = mon_vdev_id;
 	g_inj_tx_vdev.chanfreq         = chanfreq;
+	g_inj_tx_vdev.last_tx_ts       = qdf_get_log_timestamp();
+	g_inj_tx_vdev.consecutive_discards = 0;
 	qdf_mem_copy(g_inj_tx_vdev.mac_addr, inj_mac, QDF_MAC_ADDR_SIZE);
 
 	wma_info("Injection TX helper vdev created: vdev_id=%u mac=%pM freq=%u type=STA",
 		 vid, inj_mac, chanfreq);
+	qdf_mutex_release(&g_inj_tx_vdev_mutex);
 	return QDF_STATUS_SUCCESS;
 
 err_stop:
+	wmi_unified_vdev_stop_send(wma->wmi_handle, vid);
+	msleep(50);
+err_delete:
 	wmi_unified_vdev_delete_send(wma->wmi_handle, vid);
+	qdf_mutex_release(&g_inj_tx_vdev_mutex);
 	return status;
 }
 
 /**
- * wma_injection_destroy_tx_vdev() - Tear down the hidden injection TX vdev
+ * __wma_injection_destroy_tx_vdev() - Tear down the hidden injection TX vdev
  * @wma: WMA handle
  *
- * Late-path teardown (called from deinit_injection_queue / wma_close).
- * WMI may already be stopped, so failures are tolerated.
+ * Internal helper. Caller MUST hold g_inj_tx_vdev_mutex.
  */
-static void wma_injection_destroy_tx_vdev(tp_wma_handle wma)
+static void __wma_injection_destroy_tx_vdev(tp_wma_handle wma)
 {
-	if (!g_inj_tx_vdev.created || !wma || !wma->wmi_handle)
+	int wait_count = 0;
+
+	if (!g_inj_tx_vdev.created || !wma)
 		return;
+
+	if (!wma->wmi_handle) {
+		wma_warn("WMI down, clearing injection vdev state only");
+		qdf_mem_zero(&g_inj_tx_vdev, sizeof(g_inj_tx_vdev));
+		return;
+	}
+
+	/*
+	 * Wait for any in-flight frames to complete in firmware before
+	 * tearing down the peer and vdev. Deleting active peers/vdevs
+	 * with pending TX frames causes firmware asserts/crashes.
+	 */
+	while (qdf_atomic_read(&g_wma_injection_ctx.inflight_count) > 0 &&
+	       wait_count < 10) {
+		msleep(20);
+		wait_count++;
+	}
+
+	/* Force reap any leftover in-flight nbufs */
+	wma_injection_reap_stale_nbufs(true);
 
 	/*
 	 * Proper teardown order (reverse of create):
-	 *   PEER_DELETE → VDEV_STOP → VDEV_DELETE
+	 *   PEER_FLUSH_TIDS → PEER_DELETE → VDEV_STOP → VDEV_DELETE
 	 * Each step needs a sleep so firmware finishes processing
-	 * before the next command arrives.  Without this, a
-	 * subsequent VDEV_CREATE for the same slot races with the
-	 * pending DELETE and firmware asserts.
+	 * before the next command arrives.
 	 */
+
+	/* 0. PEER_FLUSH_TIDS */
+	{
+		struct peer_flush_params param = {0};
+
+		param.peer_tid_bitmap = 0xffffffff;
+		param.vdev_id = g_inj_tx_vdev.vdev_id;
+		qdf_mem_copy(param.peer_mac, g_inj_tx_vdev.mac_addr,
+			     QDF_MAC_ADDR_SIZE);
+		if (!wmi_service_enabled(wma->wmi_handle,
+					 wmi_service_peer_delete_no_peer_flush_tids_cmd))
+			wmi_unified_peer_flush_tids_send(wma->wmi_handle,
+							 g_inj_tx_vdev.mac_addr,
+							 &param);
+	}
+	msleep(50);
 
 	/* 1. PEER_DELETE */
 	wmi_unified_peer_delete_send(wma->wmi_handle,
@@ -445,6 +594,20 @@ static void wma_injection_destroy_tx_vdev(tp_wma_handle wma)
 }
 
 /**
+ * wma_injection_destroy_tx_vdev() - Tear down the hidden injection TX vdev
+ * @wma: WMA handle
+ *
+ * Late-path teardown (called from deinit_injection_queue / wma_close).
+ * WMI may already be stopped, so failures are tolerated.
+ */
+static void wma_injection_destroy_tx_vdev(tp_wma_handle wma)
+{
+	qdf_mutex_acquire(&g_inj_tx_vdev_mutex);
+	__wma_injection_destroy_tx_vdev(wma);
+	qdf_mutex_release(&g_inj_tx_vdev_mutex);
+}
+
+/**
  * wma_injection_pre_stop_cleanup() - Destroy injection helper vdev before
  *                                     monitor mode stop
  * @wma_handle: WMA handle
@@ -453,10 +616,6 @@ static void wma_injection_destroy_tx_vdev(tp_wma_handle wma)
  * VDEV_STOP / VDEV_DELETE for the monitor vdev.  The firmware asserts
  * in dispatch_wlan_pdev_cmds if an orphaned STA helper vdev is still
  * present when the monitor vdev is torn down.
- *
- * Proper teardown order (reverse of create):
- *   PEER_DELETE → VDEV_STOP → VDEV_DELETE
- * with msleep() gaps so the firmware can process each command.
  */
 void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle)
 {
@@ -465,38 +624,19 @@ void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle)
 		return;
 	}
 
-	if (!g_inj_tx_vdev.created)
-		return;
+	/* Drain and cancel queued frames first */
+	wma_flush_injection_queue(wma_handle);
 
-	if (!wma_handle->wmi_handle) {
-		/* WMI already gone – just clear host state */
-		wma_warn("WMI down, clearing injection vdev state only");
-		qdf_mem_zero(&g_inj_tx_vdev, sizeof(g_inj_tx_vdev));
+	qdf_mutex_acquire(&g_inj_tx_vdev_mutex);
+	if (!g_inj_tx_vdev.created) {
+		qdf_mutex_release(&g_inj_tx_vdev_mutex);
 		return;
 	}
 
 	wma_info("Pre-stop cleanup: destroying injection helper vdev_id=%u",
 		 g_inj_tx_vdev.vdev_id);
-
-	/* 1. PEER_DELETE */
-	wmi_unified_peer_delete_send(wma_handle->wmi_handle,
-				     g_inj_tx_vdev.mac_addr,
-				     g_inj_tx_vdev.vdev_id);
-	msleep(100);
-
-	/* 2. VDEV_STOP (we did VDEV_START during create) */
-	wmi_unified_vdev_stop_send(wma_handle->wmi_handle,
-				   g_inj_tx_vdev.vdev_id);
-	msleep(100);
-
-	/* 3. VDEV_DELETE */
-	wmi_unified_vdev_delete_send(wma_handle->wmi_handle,
-				     g_inj_tx_vdev.vdev_id);
-	msleep(100);
-
-	wma_info("Pre-stop cleanup: injection helper vdev destroyed: vdev_id=%u",
-		 g_inj_tx_vdev.vdev_id);
-	qdf_mem_zero(&g_inj_tx_vdev, sizeof(g_inj_tx_vdev));
+	__wma_injection_destroy_tx_vdev(wma_handle);
+	qdf_mutex_release(&g_inj_tx_vdev_mutex);
 }
 
 static void
@@ -507,6 +647,7 @@ wma_injection_debug_cache_update(uint32_t desc_id,
 				 uint16_t chanfreq)
 {
 	struct wma_injection_debug_info *entry;
+	qdf_nbuf_t stale_buf = NULL;
 	uint32_t slot;
 
 	if (!desc_id || !req || !req->frame_data)
@@ -515,16 +656,16 @@ wma_injection_debug_cache_update(uint32_t desc_id,
 	slot = desc_id % WMA_INJECTION_DEBUG_CACHE_SIZE;
 	entry = &g_wma_injection_debug_cache[slot];
 
+	qdf_spin_lock_bh(&g_wma_injection_debug_lock);
 	/*
 	 * If this slot was previously used for a different desc_id whose
-	 * completion never arrived, free the leaked nbuf now.
+	 * completion never arrived, safely take ownership under lock and free it outside.
 	 */
 	if (entry->valid && entry->tx_buf && entry->desc_id != desc_id) {
-		wma_warn("Injection nbuf leak cleanup: stale desc_id=%u",
-			 entry->desc_id);
-		wma_injection_unmap_tx_buf(entry->tx_buf);
-		qdf_nbuf_free(entry->tx_buf);
+		stale_buf = entry->tx_buf;
 		entry->tx_buf = NULL;
+		entry->valid = false;
+		qdf_atomic_dec(&g_wma_injection_ctx.inflight_count);
 	}
 
 	entry->valid = false;
@@ -546,24 +687,15 @@ wma_injection_debug_cache_update(uint32_t desc_id,
 	}
 
 	entry->valid = true;
+	qdf_spin_unlock_bh(&g_wma_injection_debug_lock);
+
+	if (stale_buf) {
+		wma_debug("Injection nbuf leak cleanup: stale desc_id=%u", desc_id);
+		wma_injection_unmap_tx_buf(stale_buf);
+		qdf_nbuf_free(stale_buf);
+	}
 }
 
-static struct wma_injection_debug_info *
-wma_injection_debug_cache_get(uint32_t desc_id)
-{
-	struct wma_injection_debug_info *entry;
-	uint32_t slot;
-
-	if (!desc_id)
-		return NULL;
-
-	slot = desc_id % WMA_INJECTION_DEBUG_CACHE_SIZE;
-	entry = &g_wma_injection_debug_cache[slot];
-	if (!entry->valid || entry->desc_id != desc_id)
-		return NULL;
-
-	return entry;
-}
 
 /**
  * wma_injection_desc_id_alloc() - allocate descriptor id for injection tx
@@ -630,6 +762,7 @@ wma_injection_queue_node_alloc(struct inject_frame_req *req, uint8_t vdev_id)
 	node->req.tx_flags = req->tx_flags;
 	node->req.retry_count = req->retry_count;
 	node->req.tx_rate = req->tx_rate;
+	node->req.chanfreq = req->chanfreq;
 	node->req.timestamp = req->timestamp;
 	node->req.session_id = req->session_id;
 	node->timestamp = qdf_get_log_timestamp();
@@ -668,20 +801,28 @@ static void wma_injection_queue_node_free(struct wma_injection_queue_node *node)
 static bool wma_check_traffic_coordination(tp_wma_handle wma_handle, uint8_t vdev_id)
 {
 	struct wma_txrx_node *iface;
+	int i;
+	bool any_active = false;
 
-	if (!wma_handle || vdev_id >= wma_handle->max_bssid) {
-		wma_err("Invalid parameters: wma_handle=%pK, vdev_id=%u",
-			wma_handle, vdev_id);
+	if (!wma_handle)
 		return false;
+
+	if (vdev_id >= wma_handle->max_bssid || !wma_handle->interfaces[vdev_id].vdev) {
+		for (i = 0; i < (int)wma_handle->max_bssid; i++) {
+			if (wma_handle->interfaces[i].vdev) {
+				any_active = true;
+				break;
+			}
+		}
+		if (!any_active) {
+			wma_debug("No active interface, deferring injection");
+			return false;
+		}
+		/* At least one interface is active; injection will use helper vdev */
+		return true;
 	}
 
 	iface = &wma_handle->interfaces[vdev_id];
-
-	/* Check if interface is in a state that allows injection */
-	if (!iface->vdev) {
-		wma_debug("Interface %u not active, deferring injection", vdev_id);
-		return false;
-	}
 
 	/* Check if there's high priority management traffic pending */
 	if (iface->roaming_in_progress) {
@@ -722,26 +863,8 @@ static bool wma_check_traffic_coordination(tp_wma_handle wma_handle, uint8_t vde
  */
 static uint32_t wma_apply_injection_backpressure(struct wma_injection_queue_ctx *ctx)
 {
-	uint32_t queue_utilization;
-	uint32_t delay_ms = 0;
-
-	if (!ctx || !ctx->is_initialized) {
-		return 0;
-	}
-
-	/* Calculate queue utilization percentage */
-	queue_utilization = (ctx->queue_size * 100) / ctx->max_queue_size;
-
-	/* Apply adaptive backpressure based on queue utilization */
-	if (queue_utilization > 95) {
-		/* Queue nearly full - significant backpressure */
-		delay_ms = 10;
-	} else if (queue_utilization > 85) {
-		/* Queue getting full - moderate backpressure */
-		delay_ms = 2;
-	}
-
-	return delay_ms;
+	/* Drain without artificial delay */
+	return 0;
 }
 
 /**
@@ -762,7 +885,7 @@ QDF_STATUS wma_process_injection_queue(tp_wma_handle wma_handle)
 	uint64_t current_time;
 	uint32_t processed_count = 0;
 	uint32_t deferred_count = 0;
-	const uint32_t max_process_per_cycle = 64;
+	const uint32_t max_process_per_cycle = 256;
 	bool queue_was_empty;
 
 	if (!wma_handle) {
@@ -830,6 +953,16 @@ QDF_STATUS wma_process_injection_queue(tp_wma_handle wma_handle)
 		status = wma_send_injection_frame_to_fw(wma_handle, &node->req, node->vdev_id);
 		if (QDF_IS_STATUS_SUCCESS(status)) {
 			ctx->stats.frames_processed++;
+		} else if ((status == QDF_STATUS_E_AGAIN || status == QDF_STATUS_E_RESOURCES) &&
+			   node->req.retry_count < 3) {
+			node->req.retry_count++;
+			qdf_spin_lock_bh(&ctx->queue_lock);
+			qdf_list_insert_back(&ctx->queue, &node->node);
+			ctx->queue_size++;
+			qdf_spin_unlock_bh(&ctx->queue_lock);
+			node = NULL;
+			usleep_range(100, 250);
+			break;
 		} else {
 			ctx->stats.frames_dropped++;
 			wma_err("Failed to send injection frame to firmware: %d", status);
@@ -837,8 +970,9 @@ QDF_STATUS wma_process_injection_queue(tp_wma_handle wma_handle)
 
 		processed_count++;
 
-		/* Free the node */
-		wma_injection_queue_node_free(node);
+		/* Free the node if not re-queued */
+		if (node)
+			wma_injection_queue_node_free(node);
 	}
 
 	wma_debug("Injection queue processing cycle complete: processed=%u, deferred=%u",
@@ -916,6 +1050,57 @@ static void wma_process_injection_queue_delayed_work(void *context)
 }
 
 /**
+ * wma_injection_reap_stale_nbufs() - Sweep and free stale in-flight nbufs
+ * @force: If true, reap all valid buffers regardless of age
+ *
+ * Return: number of freed nbufs
+ */
+static uint32_t wma_injection_reap_stale_nbufs(bool force)
+{
+	uint64_t now_ts = qdf_get_log_timestamp();
+	uint32_t reaped = 0;
+	int i;
+
+	for (i = 0; i < WMA_INJECTION_DEBUG_CACHE_SIZE; i++) {
+		struct wma_injection_debug_info *e =
+			&g_wma_injection_debug_cache[i];
+		qdf_nbuf_t buf_to_free = NULL;
+		uint64_t age_us;
+
+		if (!e->valid || !e->tx_buf || !e->submit_ts)
+			continue;
+
+		age_us = qdf_log_timestamp_to_usecs(now_ts - e->submit_ts);
+		if (!force && age_us < WMA_INJECTION_NBUF_TIMEOUT_US)
+			continue;
+
+		qdf_spin_lock_bh(&g_wma_injection_debug_lock);
+		if (e->valid && e->tx_buf) {
+			age_us = qdf_log_timestamp_to_usecs(now_ts - e->submit_ts);
+			if (force || age_us >= WMA_INJECTION_NBUF_TIMEOUT_US) {
+				buf_to_free = e->tx_buf;
+				e->tx_buf = NULL;
+				e->valid = false;
+				qdf_atomic_dec(&g_wma_injection_ctx.inflight_count);
+			}
+		}
+		qdf_spin_unlock_bh(&g_wma_injection_debug_lock);
+
+		if (buf_to_free) {
+			wma_debug("Reaper: freeing%s desc_id=%u age=%llu us fc=0x%02x/0x%02x",
+				  force ? " (forced)" : "",
+				  e->desc_id, age_us, e->fc_type, e->fc_subtype);
+
+			wma_injection_unmap_tx_buf(buf_to_free);
+			qdf_nbuf_free(buf_to_free);
+			reaped++;
+		}
+	}
+
+	return reaped;
+}
+
+/**
  * wma_injection_reaper_work_cb() - Periodic reaper for stale injection nbufs
  * @context: Unused
  *
@@ -925,52 +1110,24 @@ static void wma_process_injection_queue_delayed_work(void *context)
  * unchecked the DMA-mapped nbufs accumulate, eventually triggering an SMMU
  * translation fault and a firmware crash.
  *
- * This worker runs every WMA_INJECTION_REAPER_INTERVAL_MS (3 s), scans the
+ * This worker runs every WMA_INJECTION_REAPER_INTERVAL_MS, scans the
  * debug cache, and frees any entry whose submit_ts is older than
- * WMA_INJECTION_NBUF_TIMEOUT_US (2 s).
+ * WMA_INJECTION_NBUF_TIMEOUT_US.
  */
 static void wma_injection_reaper_work_cb(void *context)
 {
 	struct wma_injection_queue_ctx *ctx = &g_wma_injection_ctx;
-	uint64_t now_ts, age_us;
-	uint32_t reaped = 0;
-	int i;
+	uint32_t reaped;
 
 	if (!ctx->is_initialized)
 		return;
 
-	now_ts = qdf_get_log_timestamp();
-
-	for (i = 0; i < WMA_INJECTION_DEBUG_CACHE_SIZE; i++) {
-		struct wma_injection_debug_info *e =
-			&g_wma_injection_debug_cache[i];
-
-		if (!e->valid || !e->tx_buf || !e->submit_ts)
-			continue;
-
-		/* qdf_get_log_timestamp() ticks at 19.2 MHz on QTI SoCs;
-		 * convert delta to microseconds.
-		 */
-		age_us = qdf_log_timestamp_to_usecs(now_ts - e->submit_ts);
-
-		if (age_us < WMA_INJECTION_NBUF_TIMEOUT_US)
-			continue;
-
-		wma_debug("Reaper: freeing stale desc_id=%u age=%llu us fc=0x%02x/0x%02x",
-			  e->desc_id, age_us, e->fc_type, e->fc_subtype);
-
-		wma_injection_unmap_tx_buf(e->tx_buf);
-		qdf_nbuf_free(e->tx_buf);
-		e->tx_buf = NULL;
-		e->valid = false;
-		qdf_atomic_dec(&g_wma_injection_ctx.inflight_count);
-		reaped++;
-	}
+	reaped = wma_injection_reap_stale_nbufs(false);
 
 	if (reaped)
-		wma_info("Reaper: freed %u stale injection nbufs, inflight now %d",
-			 reaped,
-			 qdf_atomic_read(&g_wma_injection_ctx.inflight_count));
+		wma_debug("Reaper: freed %u stale injection nbufs, inflight now %d",
+			  reaped,
+			  qdf_atomic_read(&g_wma_injection_ctx.inflight_count));
 
 	/* Re-arm the periodic timer */
 	if (ctx->is_initialized)
@@ -1030,6 +1187,8 @@ QDF_STATUS wma_init_injection_queue(tp_wma_handle wma_handle)
 	ctx->max_queue_size = WMA_FRAME_INJECT_MAX_QUEUE_SIZE;
 	qdf_mem_zero(&ctx->stats, sizeof(ctx->stats));
 	qdf_atomic_init(&ctx->inflight_count);
+	qdf_mutex_create(&g_inj_tx_vdev_mutex);
+	qdf_spinlock_create(&g_wma_injection_debug_lock);
 	ctx->is_initialized = true;
 
 	/* Arm the reaper */
@@ -1064,6 +1223,7 @@ QDF_STATUS wma_deinit_injection_queue(tp_wma_handle wma_handle)
 
 	/* Destroy hidden injection TX vdev if present */
 	wma_injection_destroy_tx_vdev(wma_handle);
+	qdf_mutex_destroy(&g_inj_tx_vdev_mutex);
 
 	/* Cancel any pending work */
 	qdf_cancel_work(&ctx->queue_work);
@@ -1120,18 +1280,28 @@ QDF_STATUS wma_deinit_injection_queue(tp_wma_handle wma_handle)
 		for (i = 0; i < WMA_INJECTION_DEBUG_CACHE_SIZE; i++) {
 			struct wma_injection_debug_info *e =
 				&g_wma_injection_debug_cache[i];
+			qdf_nbuf_t buf_to_free = NULL;
+
+			qdf_spin_lock_bh(&g_wma_injection_debug_lock);
 			if (e->tx_buf) {
-				wma_injection_unmap_tx_buf(e->tx_buf);
-				qdf_nbuf_free(e->tx_buf);
+				buf_to_free = e->tx_buf;
 				e->tx_buf = NULL;
+				e->valid = false;
 				nbuf_leaked++;
 			}
-			e->valid = false;
+			qdf_spin_unlock_bh(&g_wma_injection_debug_lock);
+
+			if (buf_to_free) {
+				wma_injection_unmap_tx_buf(buf_to_free);
+				qdf_nbuf_free(buf_to_free);
+			}
 		}
 		if (nbuf_leaked)
 			wma_warn("Freed %u leaked injection nbufs during deinit",
 				 nbuf_leaked);
 	}
+
+	qdf_spinlock_destroy(&g_wma_injection_debug_lock);
 
 	return QDF_STATUS_SUCCESS;
 }
@@ -1179,12 +1349,23 @@ QDF_STATUS wma_queue_injection_frame(tp_wma_handle wma_handle,
 
 	/*
 	 * Inflight backpressure: if too many nbufs are waiting for FW
-	 * completions that will never arrive, reject early to avoid
-	 * exhausting DMA-mapped memory and triggering an SMMU fault.
-	 * The reaper timer will gradually free the stale entries.
+	 * completions that will never arrive, reap stale entries inline first.
+	 * If still over threshold, yield briefly to let FW DMA progress,
+	 * then reap once more before dropping.
 	 */
 	{
 		int inflight = qdf_atomic_read(&ctx->inflight_count);
+
+		if (inflight >= WMA_INJECTION_INFLIGHT_HIGH) {
+			wma_injection_reap_stale_nbufs(false);
+			inflight = qdf_atomic_read(&ctx->inflight_count);
+		}
+
+		if (inflight >= WMA_INJECTION_INFLIGHT_HIGH) {
+			usleep_range(500, 1000);
+			wma_injection_reap_stale_nbufs(false);
+			inflight = qdf_atomic_read(&ctx->inflight_count);
+		}
 
 		if (inflight >= WMA_INJECTION_INFLIGHT_HIGH) {
 			ctx->stats.frames_dropped++;
@@ -1356,6 +1537,9 @@ QDF_STATUS wma_flush_injection_queue(tp_wma_handle wma_handle)
 
 	qdf_spin_unlock_bh(&ctx->queue_lock);
 
+	/* Clean up any timed-out in-flight buffers */
+	wma_injection_reap_stale_nbufs(false);
+
 	wma_info("Flushed %u frames from injection queue", flushed_count);
 
 	return QDF_STATUS_SUCCESS;
@@ -1369,9 +1553,7 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 	QDF_STATUS status;
 	qdf_nbuf_t wmi_buf;
 	uint8_t *frame_data;
-	struct cdp_soc_t *soc;
 	void *qdf_ctx;
-	int ret;
 	uint16_t tx_chanfreq = 0;
 	uint8_t fc0 = 0;
 	uint8_t fc_type = 0;
@@ -1390,7 +1572,7 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 	}
 
 	if (!inject_patch_banner_logged) {
-		wma_info("Injection patch tag: monitor_sta_vdev_tx_v7");
+		wma_info("Injection patch tag: monitor_sta_vdev_tx_v8_antipanic_multiframe");
 		inject_patch_banner_logged = true;
 	}
 
@@ -1404,19 +1586,44 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 		return QDF_STATUS_E_INVAL;
 	}
 
-	if (vdev_id >= wma_handle->max_bssid) {
-		wma_err("Invalid injection vdev_id %u (max %u)",
-			vdev_id, wma_handle->max_bssid);
-		return QDF_STATUS_E_INVAL;
+	if (vdev_id >= wma_handle->max_bssid || !wma_handle->interfaces[vdev_id].vdev) {
+		int i;
+		bool found_vdev = false;
+
+		for (i = 0; i < (int)wma_handle->max_bssid; i++) {
+			if (wma_handle->interfaces[i].vdev) {
+				vdev_id = (uint8_t)i;
+				found_vdev = true;
+				break;
+			}
+		}
+		if (!found_vdev) {
+			wma_err("Injection: no active vdev available");
+			return QDF_STATUS_E_AGAIN;
+		}
 	}
 
-	if (!wma_handle->interfaces[vdev_id].vdev) {
-		wma_err("Injection vdev %u is not active", vdev_id);
-		return QDF_STATUS_E_AGAIN;
-	}
-
-	if (wma_handle->interfaces[vdev_id].mhz)
+	if (req->chanfreq)
+		tx_chanfreq = req->chanfreq;
+	else if (vdev_id < wma_handle->max_bssid && wma_handle->interfaces[vdev_id].mhz)
 		tx_chanfreq = wma_handle->interfaces[vdev_id].mhz;
+
+	if (!tx_chanfreq) {
+		int i;
+
+		for (i = 0; i < (int)wma_handle->max_bssid; i++) {
+			if (wma_handle->interfaces[i].mhz) {
+				tx_chanfreq = wma_handle->interfaces[i].mhz;
+				break;
+			}
+		}
+	}
+
+	if (!tx_chanfreq && g_inj_tx_vdev.created && g_inj_tx_vdev.chanfreq)
+		tx_chanfreq = g_inj_tx_vdev.chanfreq;
+
+	if (!tx_chanfreq)
+		tx_chanfreq = 2412;
 
 	if (req->frame_len)
 		fc0 = req->frame_data[0];
@@ -1440,11 +1647,6 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 
 	monitor_vdev =
 		(wma_handle->interfaces[vdev_id].type == WMI_VDEV_TYPE_MONITOR);
-	if (monitor_vdev && !tx_chanfreq) {
-		wma_err("Injection monitor vdev %u has zero channel frequency; dropping frame",
-			vdev_id);
-		return QDF_STATUS_E_INVAL;
-	}
 
 	/* Allocate WMI buffer for the frame */
 	wmi_buf = qdf_nbuf_alloc(NULL, req->frame_len, 0, 0, false);
@@ -1469,8 +1671,13 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 	 * probe requests before WMI submission.
 	 */
 	if (monitor_vdev && is_probe_req && is_bcast_da && req->frame_len >= 24) {
-		uint8_t *vdev_mac =
-			wlan_vdev_mlme_get_macaddr(wma_handle->interfaces[vdev_id].vdev);
+		uint8_t *vdev_mac = NULL;
+
+		if (vdev_id < wma_handle->max_bssid &&
+		    wma_handle->interfaces[vdev_id].vdev) {
+			vdev_mac = wlan_vdev_mlme_get_macaddr(
+					wma_handle->interfaces[vdev_id].vdev);
+		}
 
 		if (vdev_mac &&
 		    qdf_mem_cmp(frame_data + 10, vdev_mac, QDF_MAC_ADDR_SIZE) != 0) {
@@ -1496,17 +1703,10 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 	 */
 	mgmt_params.tx_type = GENERIC_NODOWLOAD_ACK_COMP_INDEX;
 	/*
-	 * Align with regular host management TX behavior:
-	 * probe request uses chanfreq=0 while action/auth/probe-rsp can carry
-	 * an explicit channel.
+	 * Explicit channel frequency for injected frames ensures the firmware
+	 * transmits on the intended target channel.
 	 */
-	mgmt_params.chanfreq = is_probe_req ? 0 : tx_chanfreq;
-	/*
-	 * For monitor vdev probe injection, prefer explicit channel in command
-	 * so firmware can bind probe request tx to the current monitor channel.
-	 */
-	if (monitor_vdev && is_probe_req && tx_chanfreq)
-		mgmt_params.chanfreq = tx_chanfreq;
+	mgmt_params.chanfreq = tx_chanfreq;
 	mgmt_params.desc_id = wma_injection_desc_id_alloc();
 	mgmt_params.pdata = frame_data; /* Management frame bytes for command payload */
 	mgmt_params.macaddr = NULL; /* No specific MAC address */
@@ -1559,26 +1759,25 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 		inject_wmi_service_absent_logged = true;
 	}
 
-	if (monitor_vdev) {
-		/*
-		 * FW _wlan_send_mgmt_to_host rejects MONITOR vdevs (falls
-		 * to a beacon-only path → DISCARD).  Route through a hidden
-		 * AP vdev instead, which the FW accepts for mgmt TX.
-		 */
-		status = wma_injection_ensure_tx_vdev(wma_handle,
-						     vdev_id, tx_chanfreq);
-		if (QDF_IS_STATUS_ERROR(status)) {
-			wma_err("Failed to create injection TX helper vdev: %d",
-				status);
-			qdf_nbuf_free(wmi_buf);
-			return status;
-		}
-		mgmt_params.vdev_id = g_inj_tx_vdev.vdev_id;
-		if (!inject_monitor_no_legacy_logged) {
-			wma_warn("Injection monitor: using hidden AP vdev %u for TX (monitor vdev %u)",
-				 g_inj_tx_vdev.vdev_id, vdev_id);
-			inject_monitor_no_legacy_logged = true;
-		}
+	/*
+	 * FW _wlan_send_mgmt_to_host rejects MONITOR vdevs (falls
+	 * to a beacon-only path → DISCARD) and non-associated STA vdevs.
+	 * Route through a hidden STA vdev instead, which the FW accepts
+	 * for raw mgmt TX.
+	 */
+	status = wma_injection_ensure_tx_vdev(wma_handle,
+					     vdev_id, tx_chanfreq);
+	if (QDF_IS_STATUS_ERROR(status)) {
+		wma_err("Failed to create injection TX helper vdev: %d",
+			status);
+		qdf_nbuf_free(wmi_buf);
+		return status;
+	}
+	mgmt_params.vdev_id = g_inj_tx_vdev.vdev_id;
+	if (!inject_monitor_no_legacy_logged) {
+		wma_warn("Injection: using helper STA vdev %u for TX (source vdev %u, freq %u)",
+			 g_inj_tx_vdev.vdev_id, vdev_id, tx_chanfreq);
+		inject_monitor_no_legacy_logged = true;
 	}
 
 	/* Attempt WMI management TX path. */
@@ -1591,6 +1790,7 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 	status = wmi_mgmt_unified_cmd_send(wma_handle->wmi_handle, &mgmt_params);
 	if (!QDF_IS_STATUS_ERROR(status)) {
 		wmi_tx_ok = true;
+		g_inj_tx_vdev.last_tx_ts = qdf_get_log_timestamp();
 		/*
 		 * LL path: firmware DMA-reads from the nbuf we passed as
 		 * tx_frame.  Track it so the completion handler can unmap
@@ -1601,56 +1801,27 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 					WMA_INJECTION_DEBUG_CACHE_SIZE;
 			struct wma_injection_debug_info *e =
 				&g_wma_injection_debug_cache[slot];
-			if (e->valid && e->desc_id == mgmt_params.desc_id) {
+			qdf_spin_lock_bh(&g_wma_injection_debug_lock);
+			if (e->desc_id == mgmt_params.desc_id) {
 				e->tx_buf = wmi_buf;
 				e->submit_ts = qdf_get_log_timestamp();
+				e->valid = true;
 			}
+			qdf_spin_unlock_bh(&g_wma_injection_debug_lock);
 		}
 		qdf_atomic_inc(&g_wma_injection_ctx.inflight_count);
 	} else {
-		wma_warn("WMI management TX command failed: %d (service=%u monitor=%u)",
-			 status, wmi_mgmt_service ? 1 : 0, monitor_vdev ? 1 : 0);
+		wma_warn("WMI management TX command failed: %d (service=%u)",
+			 status, wmi_mgmt_service ? 1 : 0);
+		qdf_mutex_acquire(&g_inj_tx_vdev_mutex);
+		__wma_injection_destroy_tx_vdev(wma_handle);
+		qdf_mutex_release(&g_inj_tx_vdev_mutex);
 	}
 
 	if (!wmi_tx_ok) {
-		if (monitor_vdev) {
-			wma_warn("Injection monitor vdev: dropping frame after WMI TX failure to avoid legacy FW assert");
-			qdf_nbuf_free(wmi_buf);
-			return status;
-		}
-
-		/* Fallback to legacy data path if WMI TX is unavailable or failed. */
-		if (!inject_legacy_path_logged) {
-			wma_warn("Injection using legacy cdp_mgmt_send_ext fallback (wmi_mgmt_service=%u)",
-				 wmi_mgmt_service ? 1 : 0);
-			inject_legacy_path_logged = true;
-		}
-
-		/* Try legacy CDP management send path */
-		soc = cds_get_context(QDF_MODULE_ID_SOC);
-		if (!soc) {
-			wma_err("Failed to get CDP SOC context");
-			qdf_nbuf_free(wmi_buf);
-			return QDF_STATUS_E_FAILURE;
-		}
-
-		/* Set frame control information for legacy path */
-		QDF_NBUF_CB_MGMT_TXRX_DESC_ID(wmi_buf) = mgmt_params.desc_id;
-
-		ret = cdp_mgmt_send_ext(soc, mgmt_params.vdev_id, wmi_buf,
-					mgmt_params.tx_type,
-					mgmt_params.use_6mbps,
-					mgmt_params.chanfreq);
-		if (ret == -EINVAL)
-			wma_warn("Legacy management TX got -EINVAL (desc alloc or tx pool reject)");
-		status = qdf_status_from_os_return(ret);
-		
-		if (QDF_IS_STATUS_ERROR(status)) {
-			wma_err("Legacy management TX failed: %d (wmi_attempted=%u)",
-				status, wmi_tx_attempted ? 1 : 0);
-			/* wmi_buf has either been consumed or freed at this point. */
-			return status;
-		}
+		wma_warn("Injection: dropping frame after WMI TX failure to avoid legacy FW assert");
+		qdf_nbuf_free(wmi_buf);
+		return status;
 	}
 
 	return QDF_STATUS_SUCCESS;
@@ -1661,8 +1832,12 @@ QDF_STATUS wma_handle_injection_fw_response(tp_wma_handle wma_handle,
 					     uint32_t status)
 {
 	struct wma_injection_queue_ctx *ctx = &g_wma_injection_ctx;
-	struct wma_injection_debug_info *dbg_entry;
+	struct wma_injection_debug_info *e;
+	struct wma_injection_debug_info dbg_copy;
+	qdf_nbuf_t buf_to_free = NULL;
 	const char *status_str;
+	uint32_t slot;
+	bool found = false;
 
 	if (!wma_handle) {
 		wma_err("Invalid WMA handle");
@@ -1678,13 +1853,18 @@ QDF_STATUS wma_handle_injection_fw_response(tp_wma_handle wma_handle,
 	switch (status) {
 	case WMI_MGMT_TX_COMP_TYPE_COMPLETE_OK:
 		status_str = "SUCCESS";
+		g_inj_tx_vdev.last_tx_ts = qdf_get_log_timestamp();
+		g_inj_tx_vdev.consecutive_discards = 0;
 		break;
 	case WMI_MGMT_TX_COMP_TYPE_DISCARD:
 		status_str = "DISCARDED";
 		ctx->stats.frames_dropped++;
+		g_inj_tx_vdev.consecutive_discards++;
 		break;
 	case WMI_MGMT_TX_COMP_TYPE_COMPLETE_NO_ACK:
 		status_str = "NO_ACK";
+		g_inj_tx_vdev.last_tx_ts = qdf_get_log_timestamp();
+		g_inj_tx_vdev.consecutive_discards = 0;
 		break;
 	case WMI_MGMT_TX_COMP_TYPE_INSPECT:
 		status_str = "INSPECT";
@@ -1695,8 +1875,22 @@ QDF_STATUS wma_handle_injection_fw_response(tp_wma_handle wma_handle,
 		break;
 	}
 
-	dbg_entry = wma_injection_debug_cache_get(desc_id);
-	if (dbg_entry) {
+	slot = desc_id % WMA_INJECTION_DEBUG_CACHE_SIZE;
+	e = &g_wma_injection_debug_cache[slot];
+
+	qdf_spin_lock_bh(&g_wma_injection_debug_lock);
+	if (e->valid && e->desc_id == desc_id) {
+		dbg_copy = *e;
+		buf_to_free = e->tx_buf;
+		e->tx_buf = NULL;
+		e->valid = false;
+		if (buf_to_free)
+			qdf_atomic_dec(&g_wma_injection_ctx.inflight_count);
+		found = true;
+	}
+	qdf_spin_unlock_bh(&g_wma_injection_debug_lock);
+
+	if (found) {
 		/*
 		 * Log the first few completions for each status category
 		 * so the user can verify injection works, then go silent
@@ -1705,18 +1899,18 @@ QDF_STATUS wma_handle_injection_fw_response(tp_wma_handle wma_handle,
 		if (status == WMI_MGMT_TX_COMP_TYPE_COMPLETE_OK) {
 			if (ctx->stats.frames_processed < 5)
 				wma_info("Injection completion: desc_id=%u status=OK len=%u fc_type=0x%02x fc_subtype=0x%02x chanfreq=%u",
-					 desc_id, dbg_entry->frame_len,
-					 dbg_entry->fc_type, dbg_entry->fc_subtype,
-					 dbg_entry->chanfreq);
+					 desc_id, dbg_copy.frame_len,
+					 dbg_copy.fc_type, dbg_copy.fc_subtype,
+					 dbg_copy.chanfreq);
 		} else {
 			ctx->stats.fw_errors++;
 			if (ctx->stats.fw_errors <= 10)
 				wma_info("Injection completion: desc_id=%u status=%s(%u) len=%u fc_type=0x%02x fc_subtype=0x%02x chanfreq=%u addr1=%pM addr2=%pM addr3=%pM",
 					 desc_id, status_str, status,
-					 dbg_entry->frame_len,
-					 dbg_entry->fc_type, dbg_entry->fc_subtype,
-					 dbg_entry->chanfreq, dbg_entry->addr1,
-					 dbg_entry->addr2, dbg_entry->addr3);
+					 dbg_copy.frame_len,
+					 dbg_copy.fc_type, dbg_copy.fc_subtype,
+					 dbg_copy.chanfreq, dbg_copy.addr1,
+					 dbg_copy.addr2, dbg_copy.addr3);
 		}
 
 		/*
@@ -1724,14 +1918,10 @@ QDF_STATUS wma_handle_injection_fw_response(tp_wma_handle wma_handle,
 		 * (LL path).  On HL the unmap is a no-op but the free is
 		 * still required.
 		 */
-		if (dbg_entry->tx_buf) {
-			wma_injection_unmap_tx_buf(dbg_entry->tx_buf);
-			qdf_nbuf_free(dbg_entry->tx_buf);
-			dbg_entry->tx_buf = NULL;
-			qdf_atomic_dec(&g_wma_injection_ctx.inflight_count);
+		if (buf_to_free) {
+			wma_injection_unmap_tx_buf(buf_to_free);
+			qdf_nbuf_free(buf_to_free);
 		}
-
-		dbg_entry->valid = false;
 	} else {
 		if (status != WMI_MGMT_TX_COMP_TYPE_COMPLETE_OK) {
 			ctx->stats.fw_errors++;

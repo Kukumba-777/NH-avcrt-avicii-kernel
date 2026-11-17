@@ -1605,10 +1605,26 @@ QDF_STATUS hdd_wlan_re_init(void)
 	/* Restart all adapters */
 	hdd_start_all_adapters(hdd_ctx);
 
+	/*
+	 * If no adapters exist (e.g. SSR triggered while switching driver modes),
+	 * reopen adapters for the current connection mode so that wlan0 netdev
+	 * is never lost.
+	 */
+	if (!hdd_get_first_valid_adapter(hdd_ctx)) {
+		enum QDF_GLOBAL_MODE conparam = hdd_get_conparam();
+
+		hdd_info("No adapter present during SSR re-init, reopening for mode %d",
+			 conparam);
+		hdd_open_adapters_for_mode(hdd_ctx, conparam);
+	}
+
 	hdd_init_scan_reject_params(hdd_ctx);
 
 	hdd_set_roaming_in_progress(false);
-	complete(&adapter->roaming_comp_var);
+	if (!adapter)
+		adapter = hdd_get_first_valid_adapter(hdd_ctx);
+	if (adapter)
+		complete(&adapter->roaming_comp_var);
 	hdd_ctx->bt_coex_mode_set = false;
 
 	/* Allow the phone to go to sleep */
@@ -1944,6 +1960,9 @@ static int __wlan_hdd_cfg80211_suspend_wlan(struct wiphy *wiphy,
 	if (0 != rc)
 		return rc;
 
+	/* Wait for the stop module if already in progress */
+	hdd_psoc_idle_timer_stop(hdd_ctx);
+
 	if (hdd_ctx->config->is_wow_disabled) {
 		hdd_info_rl("wow is disabled");
 		return -EINVAL;
@@ -2154,18 +2173,6 @@ int wlan_hdd_cfg80211_suspend_wlan(struct wiphy *wiphy,
 {
 	struct osif_psoc_sync *psoc_sync;
 	int errno;
-	struct hdd_context *hdd_ctx = wiphy_priv(wiphy);
-
-	errno = wlan_hdd_validate_context(hdd_ctx);
-	if (0 != errno)
-		return errno;
-
-	/*
-	 * Flush the idle shutdown before ops start.This is done here to avoid
-	 * the deadlock as idle shutdown waits for the dsc ops
-	 * to complete.
-	 */
-	hdd_psoc_idle_timer_stop(hdd_ctx);
 
 	errno = osif_psoc_sync_op_start(wiphy_dev(wiphy), &psoc_sync);
 	if (errno)
