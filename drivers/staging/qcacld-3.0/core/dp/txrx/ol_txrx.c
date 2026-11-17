@@ -5670,7 +5670,6 @@ uint8_t ol_txrx_get_mon_vdev_from_pdev(struct cdp_soc_t *soc_hdl,
 
 	if (qdf_unlikely(!pdev))
 		return -EINVAL;
-
 	if (!pdev->monitor_vdev)
 		return -EINVAL;
 

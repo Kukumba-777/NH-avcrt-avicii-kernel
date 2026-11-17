@@ -1261,6 +1261,10 @@ struct hdd_adapter {
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
 	/* QDF event for monitor mode vdev up */
 	qdf_event_t qdf_monitor_mode_vdev_up_event;
+	/* SME accepted creation of the PE monitor session (async operation). */
+	bool monitor_session_created;
+	/* A monitor RX callback is installed on this vdev. */
+	bool monitor_rx_cb_registered;
 #endif
 
 	/* TODO: move these to sta ctx. These may not be used in AP */
@@ -1850,7 +1854,7 @@ struct hdd_context {
 
 	bool is_scheduler_suspended;
 
-#ifdef WLAN_FEATURE_PKT_CAPTURE
+#if defined(WLAN_FEATURE_PKT_CAPTURE) || defined(FEATURE_MONITOR_MODE_SUPPORT)
 	bool is_ol_mon_thread_suspended;
 #endif
 
@@ -2125,7 +2129,7 @@ struct hdd_context {
 	(LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0))
 	struct pm_qos_request pm_qos_req;
 #endif
-#ifdef WLAN_FEATURE_PKT_CAPTURE
+#if defined(WLAN_FEATURE_PKT_CAPTURE) || defined(FEATURE_MONITOR_MODE_SUPPORT)
 	/* enable packet capture support */
 	bool enable_pkt_capture_support;
 	/* value for packet capturte mode */
@@ -2657,7 +2661,6 @@ QDF_STATUS hdd_stop_adapter(struct hdd_context *hdd_ctx,
 			    struct hdd_adapter *adapter);
 
 void hdd_set_station_ops(struct net_device *dev);
-void hdd_set_monitor_ops(struct net_device *dev);
 
 /**
  * wlan_hdd_get_intf_addr() - Get address for the interface
@@ -4626,13 +4629,15 @@ QDF_STATUS hdd_common_roam_callback(struct wlan_objmgr_psoc *psoc,
 #if defined(WLAN_FEATURE_PKT_CAPTURE) || defined(FEATURE_MONITOR_MODE_SUPPORT)
 
 /**
- * wlan_hdd_is_session_type_monitor() - check if session type is MONITOR
+ * wlan_hdd_is_session_type_monitor() - check if session uses pkt-capture
+ * backend
  * @session_type: session type
  *
- * Return: True - if session type for adapter is monitor, else False
+ * Return: True if this build uses packet-capture for mission-mode monitor
  *
  */
 bool wlan_hdd_is_session_type_monitor(uint8_t session_type);
+bool wlan_hdd_is_real_monitor_session(uint8_t session_type);
 
 /**
  * wlan_hdd_check_mon_concurrency() - check if MONITOR and STA concurrency
@@ -4668,13 +4673,19 @@ int wlan_hdd_add_monitor_check(struct hdd_context *hdd_ctx,
  *
  * This function is invoked to delete monitor interface.
  *
- * Return: None
+ * Return: 0 on success, negative errno on failure
  */
-void wlan_hdd_del_monitor(struct hdd_context *hdd_ctx,
-			  struct hdd_adapter *adapter, bool rtnl_held);
+int wlan_hdd_del_monitor(struct hdd_context *hdd_ctx,
+			 struct hdd_adapter *adapter, bool rtnl_held);
 #else
 static inline
 bool wlan_hdd_is_session_type_monitor(uint8_t session_type)
+{
+	return false;
+}
+
+static inline
+bool wlan_hdd_is_real_monitor_session(uint8_t session_type)
 {
 	return false;
 }
@@ -4694,12 +4705,19 @@ int wlan_hdd_add_monitor_check(struct hdd_context *hdd_ctx,
 	return 0;
 }
 
-static inline
-void wlan_hdd_del_monitor(struct hdd_context *hdd_ctx,
-			  struct hdd_adapter *adapter, bool rtnl_held)
+static inline int
+wlan_hdd_del_monitor(struct hdd_context *hdd_ctx,
+		     struct hdd_adapter *adapter, bool rtnl_held)
 {
+	return -EOPNOTSUPP;
 }
-#endif /* WLAN_FEATURE_PKT_CAPTURE */
+#endif /* WLAN_FEATURE_PKT_CAPTURE || FEATURE_MONITOR_MODE_SUPPORT */
+
+#ifdef FEATURE_MONITOR_MODE_SUPPORT
+void hdd_reset_mon_rx_cb(struct net_device *dev);
+#else
+static inline void hdd_reset_mon_rx_cb(struct net_device *dev) {}
+#endif
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)) && \
      defined(WLAN_FEATURE_11AX)
@@ -4772,15 +4790,5 @@ void hdd_init_start_completion(void);
  * Return: None
  */
 void hdd_netdev_update_features(struct hdd_adapter *adapter);
-
-/**
- * hdd_open_adapters_for_mode - Open/create adapters for specified driver mode
- * @hdd_ctx: Pointer to HDD context
- * @driver_mode: Mode to create adapters for
- *
- * Return: QDF_STATUS
- */
-QDF_STATUS hdd_open_adapters_for_mode(struct hdd_context *hdd_ctx,
-				     enum QDF_GLOBAL_MODE driver_mode);
 
 #endif /* end #if !defined(WLAN_HDD_MAIN_H) */

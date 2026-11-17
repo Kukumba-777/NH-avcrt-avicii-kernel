@@ -34,6 +34,7 @@
 #include "wlan_hdd_p2p.h"
 #include "sap_api.h"
 #include "wlan_hdd_main.h"
+#include "wlan_hdd_rx_monitor.h"
 #include "qdf_trace.h"
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
@@ -164,7 +165,7 @@ int wlan_hdd_cfg80211_remain_on_channel(struct wiphy *wiphy,
 					struct ieee80211_channel *chan,
 					unsigned int duration, u64 *cookie)
 {
-	int errno;
+	int errno = 0;
 	struct osif_vdev_sync *vdev_sync;
 
 	errno = osif_vdev_sync_op_start(wdev->netdev, &vdev_sync);
@@ -830,7 +831,8 @@ int __wlan_hdd_del_virtual_intf(struct wiphy *wiphy, struct wireless_dev *wdev)
 	struct net_device *dev = wdev->netdev;
 	struct hdd_context *hdd_ctx = (struct hdd_context *) wiphy_priv(wiphy);
 	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(dev);
-	int errno;
+	bool real_monitor;
+	int errno = 0;
 
 	hdd_enter();
 
@@ -866,8 +868,24 @@ int __wlan_hdd_del_virtual_intf(struct wiphy *wiphy, struct wireless_dev *wdev)
 		hdd_clean_up_pre_cac_interface(hdd_ctx);
 	} else if (adapter->device_mode == QDF_MONITOR_MODE ||
 		   wlan_hdd_is_session_type_monitor(adapter->device_mode)) {
-		wlan_hdd_del_monitor(hdd_ctx, adapter, TRUE);
-		hdd_reset_pktcapture_cb(OL_TXRX_PDEV_ID);
+		real_monitor = wlan_hdd_is_real_monitor_session(
+			adapter->device_mode);
+		/* Quiesce monitor RX before removing callbacks or freeing its VDEV. */
+		if (real_monitor &&
+		    test_bit(SME_SESSION_OPENED, &adapter->event_flags)) {
+			errno = hdd_disable_monitor_mode(adapter->dev);
+			if (errno)
+				goto exit;
+		}
+		if (real_monitor)
+			hdd_reset_mon_rx_cb(adapter->dev);
+		errno = wlan_hdd_del_monitor(hdd_ctx, adapter, TRUE);
+		if (errno)
+			goto exit;
+#ifdef WLAN_FEATURE_PKT_CAPTURE
+		if (!real_monitor)
+			hdd_reset_pktcapture_cb(OL_TXRX_PDEV_ID);
+#endif
 	} else {
 		wlan_hdd_release_intf_addr(hdd_ctx,
 					   adapter->mac_addr.bytes);
@@ -876,9 +894,11 @@ int __wlan_hdd_del_virtual_intf(struct wiphy *wiphy, struct wireless_dev *wdev)
 		hdd_close_adapter(hdd_ctx, adapter, true);
 	}
 
+
+exit:
 	hdd_exit();
 
-	return 0;
+	return errno;
 }
 
 int wlan_hdd_del_virtual_intf(struct wiphy *wiphy, struct wireless_dev *wdev)
@@ -889,13 +909,22 @@ int wlan_hdd_del_virtual_intf(struct wiphy *wiphy, struct wireless_dev *wdev)
 
 	adapter->delete_in_progress = true;
 	errno = osif_vdev_sync_trans_start_wait(wdev->netdev, &vdev_sync);
-	if (errno)
+	if (errno) {
+		adapter->delete_in_progress = false;
 		return errno;
+	}
 
 	osif_vdev_sync_unregister(wdev->netdev);
 	osif_vdev_sync_wait_for_ops(vdev_sync);
 
 	errno = __wlan_hdd_del_virtual_intf(wiphy, wdev);
+	if (errno) {
+		/* A failed delete leaves the netdev alive; keep its sync context. */
+		adapter->delete_in_progress = false;
+		osif_vdev_sync_register(wdev->netdev, vdev_sync);
+		osif_vdev_sync_trans_stop(vdev_sync);
+		return errno;
+	}
 
 	osif_vdev_sync_trans_stop(vdev_sync);
 	osif_vdev_sync_destroy(vdev_sync);

@@ -155,7 +155,6 @@
 #ifdef FEATURE_FRAME_INJECTION_SUPPORT
 #include "wlan_hdd_frame_inject.h"
 #endif
-#include "wlan_hdd_rx_monitor.h"
 #include <qdf_hang_event_notifier.h>
 #include "hif.h"
 #include "wlan_hdd_ioctl.h"
@@ -699,15 +698,6 @@ wlan_hdd_p2p_p2p_iface_limit[] = {
 };
 
 static const struct ieee80211_iface_limit
-	wlan_hdd_mon_iface_limit[] = {
-	{
-		.max = 3,       /* Monitor interface */
-		.types = BIT(NL80211_IFTYPE_MONITOR),
-	},
-};
-
-/* STA + Monitor combination */
-static const struct ieee80211_iface_limit
 wlan_hdd_sta_mon_iface_limit[] = {
 	{
 		.max = 1,
@@ -804,18 +794,11 @@ static struct ieee80211_iface_combination
 		.n_limits = ARRAY_SIZE(wlan_hdd_p2p_p2p_iface_limit),
 		.beacon_int_infra_match = true,
 	},
-	/* Monitor */
-	{
-		.limits = wlan_hdd_mon_iface_limit,
-		.max_interfaces = 3,
-		.num_different_channels = 2,
-		.n_limits = ARRAY_SIZE(wlan_hdd_mon_iface_limit),
-	},
-	/* STA + Monitor */
+	/* Single-interface monitor needs no separate combination in cfg80211. */
 	{
 		.limits = wlan_hdd_sta_mon_iface_limit,
 		.max_interfaces = 2,
-		.num_different_channels = 2,
+		.num_different_channels = 1,
 		.n_limits = ARRAY_SIZE(wlan_hdd_sta_mon_iface_limit),
 	},
 };
@@ -1199,9 +1182,9 @@ int wlan_hdd_send_hang_reason_event(struct hdd_context *hdd_ctx,
 				    enum qdf_hang_reason reason, uint8_t *data,
 				    size_t data_len)
 {
+	struct hdd_adapter *sta_adapter;
 	struct sk_buff *vendor_event;
 	enum qca_wlan_vendor_hang_reason hang_reason;
-	struct hdd_adapter *sta_adapter;
 	struct wireless_dev *wdev = NULL;
 
 	hdd_enter();
@@ -2315,12 +2298,12 @@ hdd_cfg80211_update_channel_info(struct hdd_context *hdd_ctx,
 	int i;
 	uint32_t freq_seg_0, freq_seg_1;
 
-	nla_attr = nla_nest_start_noflag(skb, idx);
+	nla_attr = nla_nest_start(skb, idx);
 	if (!nla_attr)
 		goto fail;
 
 	for (i = 0; i < sap_config->channel_info_count; i++) {
-		channel = nla_nest_start_noflag(skb, i);
+		channel = nla_nest_start(skb, i);
 		if (!channel)
 			goto fail;
 
@@ -2407,12 +2390,12 @@ hdd_cfg80211_update_pcl(struct hdd_context *hdd_ctx,
 	int i;
 	uint8_t chan;
 
-	nla_attr = nla_nest_start_noflag(skb, idx);
+	nla_attr = nla_nest_start(skb, idx);
 	if (!nla_attr)
 		goto fail;
 
 	for (i = 0; i < ch_list_count; i++) {
-		channel = nla_nest_start_noflag(skb, i);
+		channel = nla_nest_start(skb, i);
 		if (!channel)
 			goto fail;
 
@@ -5148,7 +5131,7 @@ hdd_roam_control_config_fill_data(struct hdd_context *hdd_ctx, uint8_t vdev_id,
 	uint32_t i = 0, freq_list[NUM_CHANNELS] = { 0 };
 	struct hdd_adapter *hdd_adapter = NULL;
 
-	config = nla_nest_start_noflag(skb, PARAM_ROAM_CONTROL_CONFIG);
+	config = nla_nest_start(skb, PARAM_ROAM_CONTROL_CONFIG);
 	if (!config) {
 		hdd_err("nla nest start failure");
 		return -EINVAL;
@@ -5201,8 +5184,8 @@ hdd_roam_control_config_fill_data(struct hdd_context *hdd_ctx, uint8_t vdev_id,
 		}
 
 		hdd_debug("num_channels %d", num_channels);
-		get_freq_scheme = nla_nest_start_noflag(skb,
-							QCA_ATTR_ROAM_CONTROL_FREQ_LIST_SCHEME);
+		get_freq_scheme = nla_nest_start(
+				skb, QCA_ATTR_ROAM_CONTROL_FREQ_LIST_SCHEME);
 		if (!get_freq_scheme) {
 			hdd_info("failed to nest start for roam scan freq");
 			return -EINVAL;
@@ -5213,8 +5196,8 @@ hdd_roam_control_config_fill_data(struct hdd_context *hdd_ctx, uint8_t vdev_id,
 			return -EINVAL;
 		}
 
-		get_freq = nla_nest_start_noflag(skb,
-						 QCA_ATTR_ROAM_CONTROL_SCAN_FREQ_LIST);
+		get_freq = nla_nest_start(
+				skb, QCA_ATTR_ROAM_CONTROL_SCAN_FREQ_LIST);
 		if (!get_freq) {
 			hdd_info("failed to nest start for roam scan freq");
 			return -EINVAL;
@@ -10774,7 +10757,7 @@ static int __wlan_hdd_cfg80211_get_preferred_freq_list(struct wiphy *wiphy,
 	}
 
 	i = QCA_WLAN_VENDOR_ATTR_GET_PREFERRED_FREQ_LIST_WEIGHED_PCL;
-	nla_attr = nla_nest_start_noflag(reply_skb, i);
+	nla_attr = nla_nest_start(reply_skb, i);
 
 	if (!nla_attr) {
 		hdd_err("nla nest start fail");
@@ -10784,7 +10767,7 @@ static int __wlan_hdd_cfg80211_get_preferred_freq_list(struct wiphy *wiphy,
 	}
 
 	for (i = 0; i < pcl_len; i++) {
-		channel = nla_nest_start_noflag(reply_skb, i);
+		channel = nla_nest_start(reply_skb, i);
 		if (!channel) {
 			hdd_err("updating pcl list failed");
 			kfree_skb(reply_skb);
@@ -14317,14 +14300,14 @@ static int hdd_populate_connectivity_check_stats_info(
 	struct nlattr *connect_stats, *connect_info;
 	uint32_t count = 0;
 
-	connect_stats = nla_nest_start_noflag(skb, DATA_PKT_STATS);
+	connect_stats = nla_nest_start(skb, DATA_PKT_STATS);
 	if (!connect_stats) {
 		hdd_err("nla_nest_start failed");
 		return -EINVAL;
 	}
 
 	if (adapter->pkt_type_bitmap & CONNECTIVITY_CHECK_SET_DNS) {
-		connect_info = nla_nest_start_noflag(skb, count);
+		connect_info = nla_nest_start(skb, count);
 		if (!connect_info) {
 			hdd_err("nla_nest_start failed count %u", count);
 			return -EINVAL;
@@ -14337,7 +14320,7 @@ static int hdd_populate_connectivity_check_stats_info(
 	}
 
 	if (adapter->pkt_type_bitmap & CONNECTIVITY_CHECK_SET_TCP_HANDSHAKE) {
-		connect_info = nla_nest_start_noflag(skb, count);
+		connect_info = nla_nest_start(skb, count);
 		if (!connect_info) {
 			hdd_err("nla_nest_start failed count %u", count);
 			return -EINVAL;
@@ -14348,7 +14331,7 @@ static int hdd_populate_connectivity_check_stats_info(
 		nla_nest_end(skb, connect_info);
 		count++;
 
-		connect_info = nla_nest_start_noflag(skb, count);
+		connect_info = nla_nest_start(skb, count);
 		if (!connect_info) {
 			hdd_err("nla_nest_start failed count %u", count);
 			return -EINVAL;
@@ -14359,7 +14342,7 @@ static int hdd_populate_connectivity_check_stats_info(
 		nla_nest_end(skb, connect_info);
 		count++;
 
-		connect_info = nla_nest_start_noflag(skb, count);
+		connect_info = nla_nest_start(skb, count);
 		if (!connect_info) {
 			hdd_err("nla_nest_start failed count %u", count);
 			return -EINVAL;
@@ -14372,7 +14355,7 @@ static int hdd_populate_connectivity_check_stats_info(
 	}
 
 	if (adapter->pkt_type_bitmap & CONNECTIVITY_CHECK_SET_ICMPV4) {
-		connect_info = nla_nest_start_noflag(skb, count);
+		connect_info = nla_nest_start(skb, count);
 		if (!connect_info) {
 			hdd_err("nla_nest_start failed count %u", count);
 			return -EINVAL;
@@ -14841,7 +14824,7 @@ static int wlan_hdd_fill_intf_info(struct sk_buff *skb,
 	if (!hdd_adapter)
 		goto error;
 
-	attr = nla_nest_start_noflag(skb, index);
+	attr = nla_nest_start(skb, index);
 	if (!attr)
 		goto error;
 
@@ -14892,7 +14875,7 @@ static int wlan_hdd_fill_mac_info(struct sk_buff *skb,
 		return 0;
 
 	i = 0;
-	attr = nla_nest_start_noflag(skb, mac_id);
+	attr = nla_nest_start(skb, mac_id);
 	if (!attr)
 		goto error;
 
@@ -14900,8 +14883,7 @@ static int wlan_hdd_fill_mac_info(struct sk_buff *skb,
 	    nla_put_u32(skb, QCA_WLAN_VENDOR_ATTR_MAC_INFO_BAND, band))
 		goto error;
 
-	intf_attr = nla_nest_start_noflag(skb,
-					  QCA_WLAN_VENDOR_ATTR_MAC_IFACE_INFO);
+	intf_attr = nla_nest_start(skb, QCA_WLAN_VENDOR_ATTR_MAC_IFACE_INFO);
 	if (!intf_attr)
 		goto error;
 
@@ -14959,7 +14941,7 @@ int wlan_hdd_send_mode_change_event(void)
 		return -ENOMEM;
 	}
 
-	attr = nla_nest_start_noflag(skb, QCA_WLAN_VENDOR_ATTR_MAC_INFO);
+	attr = nla_nest_start(skb, QCA_WLAN_VENDOR_ATTR_MAC_INFO);
 	if (!attr) {
 		hdd_err("nla_nest_start failed");
 		kfree_skb(skb);
@@ -15807,7 +15789,7 @@ const struct wiphy_vendor_command hdd_wiphy_vendor_commands[] = {
 	FEATURE_FRAME_INJECTION_VENDOR_COMMANDS,
 #endif
 #ifdef WLAN_BCN_RECV_FEATURE
-	BCN_RECV_FEATURE_VENDOR_COMMANDS,
+	BCN_RECV_FEATURE_VENDOR_COMMANDS
 #endif
 	{
 		.info.vendor_id = QCA_NL80211_VENDOR_ID,
@@ -17265,9 +17247,6 @@ static int __wlan_hdd_cfg80211_change_iface(struct wiphy *wiphy,
 	if (errno)
 		return errno;
 
-	if (wlan_hdd_check_mon_concurrency())
-		return -EINVAL;
-
 	qdf_mtrace(QDF_MODULE_ID_HDD, QDF_MODULE_ID_HDD,
 		   TRACE_CODE_HDD_CFG80211_CHANGE_IFACE,
 		   adapter->vdev_id, type);
@@ -17275,6 +17254,10 @@ static int __wlan_hdd_cfg80211_change_iface(struct wiphy *wiphy,
 	status = hdd_nl_to_qdf_iface_type(type, &new_mode);
 	if (QDF_IS_STATUS_ERROR(status))
 		return qdf_status_to_os_return(status);
+
+	if (wlan_hdd_check_mon_concurrency() &&
+	    new_mode != QDF_MONITOR_MODE)
+		return -EINVAL;
 
 	/* A userspace issue leads to it sending a 'change to station mode'
 	 * request on a "p2p" device, expecting the driver do execute a 'change
@@ -17372,15 +17355,6 @@ static int __wlan_hdd_cfg80211_change_iface(struct wiphy *wiphy,
 			}
 
 			hdd_set_ap_ops(adapter->dev);
-		} else if (new_mode == QDF_MONITOR_MODE) {
-			hdd_stop_adapter(hdd_ctx, adapter);
-			hdd_deinit_adapter(hdd_ctx, adapter, true);
-			memset(&adapter->session, 0, sizeof(adapter->session));
-			adapter->device_mode = QDF_MONITOR_MODE;
-			adapter->dev->type = ARPHRD_IEEE80211_RADIOTAP;
-#ifdef FEATURE_MONITOR_MODE_SUPPORT
-			hdd_set_monitor_ops(adapter->dev);
-#endif
 		} else {
 			hdd_err("Changing to device mode '%s' is not supported",
 				qdf_opmode_str(new_mode));
@@ -17405,23 +17379,6 @@ static int __wlan_hdd_cfg80211_change_iface(struct wiphy *wiphy,
 			errno = -EOPNOTSUPP;
 			goto err;
 		}
-	} else if (adapter->device_mode == QDF_MONITOR_MODE) {
-		if (hdd_is_client_mode(new_mode)) {
-#ifdef FEATURE_MONITOR_MODE_SUPPORT
-			hdd_disable_monitor_mode(adapter->dev);
-#endif
-			hdd_stop_adapter(hdd_ctx, adapter);
-			hdd_deinit_adapter(hdd_ctx, adapter, true);
-			memset(&adapter->session, 0, sizeof(adapter->session));
-			adapter->device_mode = new_mode;
-			adapter->dev->type = ARPHRD_ETHER;
-			hdd_set_station_ops(adapter->dev);
-		} else {
-			hdd_err("Changing from monitor to '%s' is not supported",
-				qdf_opmode_str(new_mode));
-			errno = -EOPNOTSUPP;
-			goto err;
-		}
 	} else {
 		hdd_err("Changing from device mode '%s' is not supported",
 			qdf_opmode_str(adapter->device_mode));
@@ -17436,22 +17393,6 @@ static int __wlan_hdd_cfg80211_change_iface(struct wiphy *wiphy,
 			hdd_err("Failed to start adapter");
 			errno = -EINVAL;
 			goto err;
-		}
-
-		if (adapter->device_mode == QDF_MONITOR_MODE) {
-#ifdef FEATURE_MONITOR_MODE_SUPPORT
-			errno = hdd_set_mon_rx_cb(adapter->dev);
-			if (!errno)
-				errno = hdd_enable_monitor_mode(adapter->dev);
-			if (errno) {
-				hdd_err("Failed to enable monitor mode: %d", errno);
-				goto err;
-			}
-			set_bit(DEVICE_IFACE_OPENED, &adapter->event_flags);
-			wlan_hdd_netif_queue_control(adapter,
-						     WLAN_START_ALL_NETIF_QUEUE_N_CARRIER,
-						     WLAN_CONTROL_PATH);
-#endif
 		}
 	}
 
@@ -24098,13 +24039,23 @@ static int wlan_hdd_cfg80211_get_channel(struct wiphy *wiphy,
 					 struct wireless_dev *wdev,
 					 struct cfg80211_chan_def *chandef)
 {
-	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(wdev->netdev);
+	struct hdd_adapter *adapter;
+	struct hdd_context *hdd_ctx;
 	struct hdd_station_ctx *sta_ctx;
 	struct hdd_mon_set_ch_info *ch_info;
 	struct ieee80211_channel *chan;
+	struct ch_params ch_params = {0};
 	uint32_t freq;
 
-	if (!adapter)
+	if (!wdev || !wdev->netdev || !chandef)
+		return -EINVAL;
+	adapter = WLAN_HDD_GET_PRIV_PTR(wdev->netdev);
+	if (!adapter || adapter->device_mode != QDF_MONITOR_MODE)
+		return -EOPNOTSUPP;
+	hdd_ctx = WLAN_HDD_GET_CTX(adapter);
+	if (wlan_hdd_validate_context(hdd_ctx))
+		return -ENODEV;
+	if (!test_bit(SME_SESSION_OPENED, &adapter->event_flags))
 		return -ENODATA;
 
 	/* Primary source: adapter->mon_chan_freq (set by both boot-time
@@ -24141,9 +24092,32 @@ static int wlan_hdd_cfg80211_get_channel(struct wiphy *wiphy,
 	case CH_WIDTH_160MHZ:
 		chandef->width = NL80211_CHAN_WIDTH_160;
 		break;
+	case CH_WIDTH_5MHZ:
+		chandef->width = NL80211_CHAN_WIDTH_5;
+		break;
+	case CH_WIDTH_10MHZ:
+		chandef->width = NL80211_CHAN_WIDTH_10;
+		break;
+	case CH_WIDTH_80P80MHZ:
+		/* The cached monitor state does not retain the second segment. */
+		return -ENODATA;
 	default:
 		break;
 	}
+
+	if (adapter->mon_bandwidth == CH_WIDTH_40MHZ ||
+	    adapter->mon_bandwidth == CH_WIDTH_80MHZ ||
+	    adapter->mon_bandwidth == CH_WIDTH_160MHZ) {
+		ch_params.ch_width = adapter->mon_bandwidth;
+		wlan_reg_set_channel_params_for_freq(hdd_ctx->pdev, freq, 0,
+						     &ch_params);
+		if (ch_params.ch_width != adapter->mon_bandwidth ||
+		    !ch_params.mhz_freq_seg0)
+			return -ENODATA;
+		chandef->center_freq1 = ch_params.mhz_freq_seg0;
+	}
+	if (!cfg80211_chandef_valid(chandef))
+		return -ENODATA;
 
 	return 0;
 }
@@ -24174,6 +24148,8 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 	enum channel_state chan_freq_state;
 	uint8_t max_fw_bw;
 	enum phy_ch_width ch_width;
+	uint8_t num_open_session = 0;
+	qdf_freq_t channel_freq;
 
 	hdd_enter();
 
@@ -24181,11 +24157,38 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 	if (ret)
 		return ret;
 
+	if (!chandef || !chandef->chan || !cfg80211_chandef_valid(chandef))
+		return -EINVAL;
+
 	mac_handle = hdd_ctx->mac_handle;
 
 	adapter = hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE);
 	if (!adapter)
 		return -EIO;
+	/* Packet-capture monitors have no SME session to retune. */
+	if (wlan_hdd_is_session_type_monitor(adapter->device_mode))
+		return -EOPNOTSUPP;
+	if (!test_bit(SME_SESSION_OPENED, &adapter->event_flags))
+		return -ENETDOWN;
+	/* The SME channel-change request is safe only with monitor by itself. */
+	if (QDF_STATUS_SUCCESS != policy_mgr_mode_specific_num_open_sessions(
+						 hdd_ctx->psoc, QDF_SAP_MODE,
+						 &num_open_session) || num_open_session)
+		return -EBUSY;
+	if (QDF_STATUS_SUCCESS != policy_mgr_mode_specific_num_open_sessions(
+						 hdd_ctx->psoc, QDF_P2P_GO_MODE,
+						 &num_open_session) || num_open_session)
+		return -EBUSY;
+	if (QDF_STATUS_SUCCESS != policy_mgr_mode_specific_num_open_sessions(
+						 hdd_ctx->psoc, QDF_P2P_CLIENT_MODE,
+						 &num_open_session))
+		return -EBUSY;
+	if (num_open_session) {
+		/* P2P client is not currently validated for monitor concurrency. */
+		return -EBUSY;
+	}
+	if (policy_mgr_get_connection_count(hdd_ctx->psoc))
+		return -EBUSY;
 
 	hdd_debug("%s: set monitor mode freq %d",
 		  adapter->dev->name, chandef->chan->center_freq);
@@ -24219,33 +24222,48 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 			ch_width, max_fw_bw);
 		return -EINVAL;
 	}
+	ret = hdd_validate_channel_and_bandwidth(adapter,
+					       chandef->chan->center_freq,
+					       ch_width);
+	if (ret)
+		return ret;
+	if (adapter->monitor_mode_vdev_up_in_progress)
+		return -EBUSY;
+
 	sta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);
 	ch_info = &sta_ctx->ch_info;
-	roam_profile.ch_params.ch_width = ch_width;
-	hdd_mon_select_cbmode(adapter, chandef->chan->center_freq,
-			      &roam_profile.ch_params);
-	roam_profile.ChannelInfo.freq_list = &ch_info->freq;
+	qdf_mem_zero(&roam_profile, sizeof(roam_profile));
+	channel_freq = chandef->chan->center_freq;
+	roam_profile.ChannelInfo.freq_list = &channel_freq;
 	roam_profile.ChannelInfo.numOfChannels = 1;
 	roam_profile.phyMode = ch_info->phy_mode;
+	roam_profile.ch_params.ch_width = ch_width;
+	hdd_select_cbmode(adapter, chandef->chan->center_freq,
+			  &roam_profile.ch_params);
 
 	qdf_mem_copy(bssid.bytes, adapter->mac_addr.bytes,
 		     QDF_MAC_ADDR_SIZE);
 
+	qdf_mem_zero(&ch_params, sizeof(ch_params));
 	ch_params.ch_width = ch_width;
 	wlan_reg_set_channel_params_for_freq(hdd_ctx->pdev,
 					     chandef->chan->center_freq,
 					     0, &ch_params);
-
-	{
-		struct hdd_adapter *sta_adapter = hdd_get_adapter(hdd_ctx, QDF_STA_MODE);
-		if (sta_adapter && test_bit(DEVICE_IFACE_OPENED, &sta_adapter->event_flags)) {
-			adapter->mon_chan_freq = chandef->chan->center_freq;
-			adapter->mon_bandwidth = ch_width;
-			hdd_info("Monitor channel set to %d (concurrent with active STA)",
-				 chandef->chan->center_freq);
-			return 0;
-		}
+	if (ch_params.ch_width != ch_width ||
+	    (ch_width == CH_WIDTH_80P80MHZ)) {
+		hdd_err("Unsupported monitor channel/bandwidth combination");
+		return -EINVAL;
 	}
+	if ((ch_width == CH_WIDTH_40MHZ ||
+	     ch_width == CH_WIDTH_80MHZ ||
+	     ch_width == CH_WIDTH_160MHZ) &&
+	    chandef->center_freq1 != ch_params.mhz_freq_seg0) {
+		hdd_err("Monitor chandef center %u mismatches regulatory center %u",
+			chandef->center_freq1, ch_params.mhz_freq_seg0);
+		return -EINVAL;
+	}
+	/* Keep the request's width and regulatory center/offset in agreement. */
+	roam_profile.ch_params = ch_params;
 
 	if (wlan_hdd_change_hw_mode_for_given_chnl(adapter,
 						   chandef->chan->center_freq,
@@ -24302,15 +24320,6 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 
 	adapter->mon_chan_freq = chandef->chan->center_freq;
 	adapter->mon_bandwidth = ch_width;
-#ifdef FEATURE_FRAME_INJECTION_SUPPORT
-	{
-		tp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);
-
-		if (wma && adapter->vdev_id < wma->max_bssid)
-			wma->interfaces[adapter->vdev_id].mhz =
-				chandef->chan->center_freq;
-	}
-#endif
 
 	hdd_exit();
 

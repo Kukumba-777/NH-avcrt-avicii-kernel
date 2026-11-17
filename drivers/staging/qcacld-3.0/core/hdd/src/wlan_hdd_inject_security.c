@@ -70,7 +70,7 @@ struct injection_session {
  */
 static uint64_t hdd_get_current_time_ms(void)
 {
-	return (uint64_t)qdf_mc_timer_get_system_time();
+	return qdf_get_log_timestamp();
 }
 
 /**
@@ -237,18 +237,8 @@ static QDF_STATUS hdd_create_injection_session(struct injection_security_ctx *se
 	session->start_time = hdd_get_current_time_ms();
 	session->frame_count = 0;
 
-	/* Add to active sessions list, evicting oldest entry if full */
+	/* Add to active sessions list */
 	qdf_spin_lock_bh(&security_ctx->session_lock);
-	if (qdf_list_size(&security_ctx->active_sessions) >= 64) {
-		qdf_list_node_t *old_node;
-
-		if (QDF_IS_STATUS_SUCCESS(
-			qdf_list_remove_front(&security_ctx->active_sessions, &old_node))) {
-			struct injection_session *old_sess =
-				qdf_container_of(old_node, struct injection_session, node);
-			qdf_mem_free(old_sess);
-		}
-	}
 	status = qdf_list_insert_back(&security_ctx->active_sessions, &session->node);
 	qdf_spin_unlock_bh(&security_ctx->session_lock);
 
@@ -321,11 +311,6 @@ QDF_STATUS hdd_apply_injection_rate_limit(struct hdd_adapter *adapter)
 	current_time = hdd_get_current_time_ms();
 	max_rate = security_ctx->config.max_frame_rate;
 	window_ms = security_ctx->config.rate_window_ms;
-
-	/* If max_rate is 0 or monitor mode is active, rate limiting is disabled */
-	if (max_rate == 0 || adapter->device_mode == QDF_MONITOR_MODE ||
-	    adapter->injection_ctx->is_monitor_mode)
-		return QDF_STATUS_SUCCESS;
 
 	hdd_security_debug("Applying rate limit: current_time=%llu, max_rate=%u, window=%u",
 			   current_time, max_rate, window_ms);

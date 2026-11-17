@@ -49,13 +49,13 @@ struct wiphy;
 struct wireless_dev;
 
 /* Maximum frame size for injection (including 802.11 header) */
-#define HDD_FRAME_INJECT_MAX_SIZE        2346
+#define HDD_FRAME_INJECT_MAX_SIZE        2304
 
 /* Maximum number of frames in injection queue per adapter */
-#define HDD_FRAME_INJECT_MAX_QUEUE_SIZE  4096
+#define HDD_FRAME_INJECT_MAX_QUEUE_SIZE  64
 
-/* Default rate limit: frames per second (0 = disabled/unlimited for Kali NetHunter) */
-#define HDD_FRAME_INJECT_DEFAULT_RATE_LIMIT  0
+/* Default rate limit: frames per second */
+#define HDD_FRAME_INJECT_DEFAULT_RATE_LIMIT  100
 
 /* Rate limiting window in milliseconds */
 #define HDD_FRAME_INJECT_RATE_WINDOW_MS  1000
@@ -190,7 +190,6 @@ struct inject_frame_req {
 	uint32_t tx_flags;
 	uint8_t retry_count;
 	uint32_t tx_rate;
-	uint32_t chanfreq;
 	uint64_t timestamp;
 	uint32_t session_id;
 	qdf_list_node_t node;
@@ -363,7 +362,6 @@ struct hdd_injection_ctx {
 	qdf_spinlock_t queue_lock;
 	struct injection_security_ctx security_ctx;
 	bool is_monitor_mode;
-	bool is_disabled;
 	qdf_work_t queue_work;
 	struct hdd_adapter *adapter;
 	void *wma_handle;

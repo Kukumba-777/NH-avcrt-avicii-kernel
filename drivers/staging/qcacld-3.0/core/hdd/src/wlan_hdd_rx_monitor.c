@@ -25,6 +25,7 @@
 #include <cds_utils.h>
 #include "wlan_hdd_rx_monitor.h"
 #include "ol_txrx.h"
+#include <cdp_txrx_cmn.h>
 #ifdef FEATURE_FRAME_INJECTION_SUPPORT
 #include "wlan_hdd_frame_inject.h"
 #endif
@@ -135,8 +136,11 @@ int hdd_enable_monitor_mode(struct net_device *dev)
 
 	hdd_enter_dev(dev);
 
+	if (!soc)
+		return -ENODEV;
+
 	vdev_id = cdp_get_mon_vdev_from_pdev(soc, OL_TXRX_PDEV_ID);
-	if (vdev_id < 0)
+	if (vdev_id == (uint8_t)-EINVAL)
 		return -EINVAL;
 
 	ret = cdp_set_monitor_mode(soc, vdev_id, false);
@@ -166,17 +170,15 @@ int hdd_enable_monitor_mode(struct net_device *dev)
 int hdd_disable_monitor_mode(struct net_device *dev)
 {
 	void *soc = cds_get_context(QDF_MODULE_ID_SOC);
-	uint8_t vdev_id;
-	int ret;
+	QDF_STATUS status;
 #ifdef FEATURE_FRAME_INJECTION_SUPPORT
 	struct hdd_adapter *adapter = WLAN_HDD_GET_PRIV_PTR(dev);
 #endif
 
 	hdd_enter_dev(dev);
 
-	vdev_id = cdp_get_mon_vdev_from_pdev(soc, OL_TXRX_PDEV_ID);
-	if (vdev_id < 0)
-		return -EINVAL;
+	if (!soc)
+		return -ENODEV;
 
 #ifdef FEATURE_FRAME_INJECTION_SUPPORT
 	/* Disable frame injection when monitor mode is disabled */
@@ -188,7 +190,10 @@ int hdd_disable_monitor_mode(struct net_device *dev)
 	}
 #endif
 
-	ret = cdp_set_monitor_mode(soc, vdev_id, true);
+	/* smart_monitor=true is not a reset; it leaves monitor RX configured. */
+	/* Remove the callback before changing shared monitor datapath state. */
+	hdd_reset_mon_rx_cb(dev);
+	status = cdp_reset_monitor_mode(soc, OL_TXRX_PDEV_ID, false);
 
-	return ret;
+	return qdf_status_to_os_return(status);
 }

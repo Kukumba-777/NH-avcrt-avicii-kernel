@@ -691,13 +691,13 @@ static bool is_valid_ie_attr(const struct nlattr *attr)
 }
 
 /* message building helper */
-static inline void *nl80211hdr_put(struct sk_buff *skb, u32 portid, u32 seq,
+void *nl80211hdr_put(struct sk_buff *skb, u32 portid, u32 seq,
 				   int flags, u8 cmd)
 {
 	/* since there is no private header just add the generic one */
 	return genlmsg_put(skb, portid, seq, &nl80211_fam, flags, cmd);
 }
-
+EXPORT_SYMBOL(nl80211hdr_put);
 static int nl80211_msg_put_wmm_rules(struct sk_buff *msg,
 				     const struct ieee80211_reg_rule *rule)
 {

@@ -261,7 +261,6 @@ QDF_STATUS hdd_frame_inject_enable(struct hdd_adapter *adapter)
 	}
 
 	injection_ctx = adapter->injection_ctx;
-	injection_ctx->is_disabled = false;
 	injection_ctx->is_monitor_mode = true;
 
 	hdd_inject_info("Frame injection enabled for adapter %pK", adapter);
@@ -279,7 +278,6 @@ QDF_STATUS hdd_frame_inject_enable(struct hdd_adapter *adapter)
 QDF_STATUS hdd_frame_inject_disable(struct hdd_adapter *adapter)
 {
 	struct hdd_injection_ctx *injection_ctx;
-	tp_wma_handle wma;
 
 	hdd_inject_debug("Disabling frame injection for adapter %pK", adapter);
 
@@ -289,35 +287,9 @@ QDF_STATUS hdd_frame_inject_disable(struct hdd_adapter *adapter)
 	}
 
 	injection_ctx = adapter->injection_ctx;
-	injection_ctx->is_disabled = true;
 	injection_ctx->is_monitor_mode = false;
 
-	/* Cancel and flush pending HDD workqueue processing */
-	qdf_cancel_work(&injection_ctx->queue_work);
-	qdf_flush_work(&injection_ctx->queue_work);
-
-	/* Drain and free any queued requests in HDD queue */
-	qdf_spin_lock_bh(&injection_ctx->queue_lock);
-	while (!qdf_list_empty(&injection_ctx->injection_queue)) {
-		qdf_list_node_t *node = NULL;
-		struct inject_frame_req *req;
-
-		if (QDF_IS_STATUS_ERROR(qdf_list_remove_front(
-				&injection_ctx->injection_queue, &node)))
-			break;
-		req = qdf_container_of(node, struct inject_frame_req, node);
-		if (req->frame_data)
-			qdf_mem_free(req->frame_data);
-		qdf_mem_free(req);
-	}
-	qdf_spin_unlock_bh(&injection_ctx->queue_lock);
-
-	/* Also flush WMA injection queue */
-	wma = cds_get_context(QDF_MODULE_ID_WMA);
-	if (wma)
-		wma_flush_injection_queue(wma);
-
-	hdd_inject_info("Frame injection disabled and flushed for adapter %pK", adapter);
+	hdd_inject_info("Frame injection disabled for adapter %pK", adapter);
 	return QDF_STATUS_SUCCESS;
 }
 
@@ -336,13 +308,13 @@ static QDF_STATUS hdd_create_injection_request(struct hdd_frame_inject_ioctl *io
 	struct inject_frame_req *injection_req;
 	uint8_t *frame_data;
 
-	hdd_inject_debug("Creating injection request: len=%u, flags=0x%x",
-			 ioctl_data->frame_len, ioctl_data->tx_flags);
-
 	if (!ioctl_data || !req) {
 		hdd_inject_err("Invalid parameters");
 		return QDF_STATUS_E_INVAL;
 	}
+
+	hdd_inject_debug("Creating injection request: len=%u, flags=0x%x",
+			 ioctl_data->frame_len, ioctl_data->tx_flags);
 
 	/* Validate frame length */
 	if (ioctl_data->frame_len == 0 || 
@@ -412,13 +384,13 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 	QDF_STATUS status;
 	uint8_t frame_type;
 
-	hdd_inject_debug("Processing frame injection: session_id=%u, len=%u",
-			 req->session_id, req->frame_len);
-
-	if (!adapter || !adapter->injection_ctx || !req) {
+	if (!adapter || !adapter->injection_ctx || !req || !req->frame_data) {
 		hdd_inject_err("Invalid parameters");
 		return QDF_STATUS_E_INVAL;
 	}
+
+	hdd_inject_debug("Processing frame injection: session_id=%u, len=%u",
+			 req->session_id, req->frame_len);
 
 	/* Check global enable flag */
 	if (!hdd_injection_is_globally_enabled()) {
@@ -462,13 +434,13 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 	}
 
 	/*
-	 * Injection supports 802.11 management (0x00), control (0x04),
-	 * and data (0x08) frames for pen-testing tools (aireplay-ng, mdk4, etc.).
+	 * Injection currently transmits via WMI mgmt-tx path, so only 802.11
+	 * management frames are supported on this path.
 	 */
 	frame_type = req->frame_data[0] & 0x0c;
-	if (frame_type != 0x00 && frame_type != 0x04 && frame_type != 0x08) {
+	if (frame_type != 0x00) {
 		hdd_update_injection_stats(adapter, HDD_INJECTION_STAT_VALIDATION_FAILURES, 1);
-		hdd_inject_warn("Dropping invalid injection frame type: fc_type=0x%02x len=%u",
+		hdd_inject_warn("Dropping non-management injection frame: fc_type=0x%02x len=%u",
 				frame_type, req->frame_len);
 		return QDF_STATUS_E_NOSUPPORT;
 	}
@@ -485,6 +457,10 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 		return QDF_STATUS_E_RESOURCES;
 	}
 	
+	/* Publish timing before a running worker can take ownership of req. */
+	req->queue_time = qdf_get_log_timestamp();
+	hdd_inject_debug("Queuing frame injection: session_id=%u",
+			 req->session_id);
 	status = qdf_list_insert_back(&injection_ctx->injection_queue, &req->node);
 	qdf_spin_unlock_bh(&injection_ctx->queue_lock);
 
@@ -492,9 +468,6 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 		hdd_inject_err("Failed to queue injection request: %d", status);
 		return status;
 	}
-
-	/* Update timing for queue entry */
-	req->queue_time = qdf_get_log_timestamp();
 
 	/* Update statistics for successful submission */
 	hdd_update_injection_stats(adapter, HDD_INJECTION_STAT_FRAMES_SUBMITTED, 1);
@@ -508,8 +481,7 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 	/* Schedule work to process the queue */
 	qdf_sched_work(0, &injection_ctx->queue_work);
 
-	hdd_inject_debug("Frame injection queued successfully: session_id=%u",
-			 req->session_id);
+	/* req belongs to the worker after publication; do not dereference it. */
 	return QDF_STATUS_SUCCESS;
 }
 
@@ -612,8 +584,8 @@ void hdd_process_injection_queue_work(void *arg)
 	QDF_STATUS status;
 	static bool queue_tx_path_logged;
 
-	if (!injection_ctx || injection_ctx->is_disabled) {
-		hdd_inject_debug("Invalid or disabled injection context");
+	if (!injection_ctx) {
+		hdd_inject_err("Invalid injection context");
 		return;
 	}
 
@@ -642,8 +614,7 @@ void hdd_process_injection_queue_work(void *arg)
 				bool monitor_mode_active =
 					injection_ctx->is_monitor_mode;
 
-				if (!monitor_mode_active && !injection_ctx->is_disabled &&
-				    injection_ctx->adapter) {
+				if (!monitor_mode_active && injection_ctx->adapter) {
 					struct net_device *tx_dev =
 						injection_ctx->adapter->dev;
 
@@ -690,8 +661,6 @@ void hdd_process_injection_queue_work(void *arg)
 				} else if (cdp_mon_vdev_id != 0xff &&
 					   cdp_mon_vdev_id != (uint8_t)-EINVAL) {
 					tx_vdev_id = cdp_mon_vdev_id;
-				} else if (injection_ctx->adapter) {
-					tx_vdev_id = injection_ctx->adapter->vdev_id;
 				}
 			}
 
@@ -718,13 +687,12 @@ void hdd_process_injection_queue_work(void *arg)
 			req->complete_time = qdf_get_log_timestamp();
 
 			if (QDF_IS_STATUS_SUCCESS(wma_status)) {
-				hdd_update_injection_stats(injection_ctx->adapter, HDD_INJECTION_STAT_FRAMES_TRANSMITTED, 1);
-				
-				/* Calculate and update latency statistics */
+				/* This is queue acceptance, not proof of over-the-air TX. */
+				/* Calculate and update queue latency statistics */
 				total_latency = req->complete_time - req->submit_time;
 				hdd_update_injection_latency(injection_ctx->adapter, total_latency);
 				
-				hdd_inject_debug("Frame queued to WMA successfully: session_id=%u, latency=%llu us",
+				hdd_inject_debug("Frame accepted by WMA queue: session_id=%u, latency=%llu us",
 						 req->session_id, total_latency);
 			} else {
 				hdd_update_injection_stats(injection_ctx->adapter, HDD_INJECTION_STAT_FRAMES_DROPPED, 1);
@@ -732,19 +700,9 @@ void hdd_process_injection_queue_work(void *arg)
 			}
 			}
 		} else {
-			/* Fallback: just update statistics if WMA handle not available */
-			{
-			uint64_t total_latency;
-
-			req->complete_time = qdf_get_log_timestamp();
-			hdd_update_injection_stats(injection_ctx->adapter, HDD_INJECTION_STAT_FRAMES_TRANSMITTED, 1);
-			
-			/* Calculate and update latency statistics */
-			total_latency = req->complete_time - req->submit_time;
-			hdd_update_injection_latency(injection_ctx->adapter, total_latency);
-			
-			hdd_inject_warn("WMA handle not available, simulating transmission");
-			}
+			hdd_update_injection_stats(injection_ctx->adapter,
+					   HDD_INJECTION_STAT_FRAMES_DROPPED, 1);
+			hdd_inject_err("WMA handle unavailable; frame was not transmitted");
 		}
 
 		hdd_inject_debug("Processed injection request: session_id=%u",
